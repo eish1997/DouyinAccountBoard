@@ -1,0 +1,85 @@
+import base64
+import csv
+import io
+import json
+import subprocess
+import tempfile
+from pathlib import Path
+from datetime import date
+import auth
+import backup
+import backup_management
+import data_exchange
+import operations
+import nurture
+
+class ExportTimeout(Exception):
+    pass
+
+class ExportFileError(Exception):
+    pass
+
+NODE=Path('C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node.exe')
+EXPORT_WORKER_TIMEOUT_SECONDS=90
+
+
+def get(db,actor,path,query,db_path):
+    if path.endswith('/history'):
+        auth.require(actor,'history_view')
+        return operations.history(db,query.get('entity',[''])[0],int(query.get('before',['0'])[0]),actor=actor)
+    if path.endswith('/backups'):
+        auth.require(actor,'owner');return dict(backups=backup_management.listing(db_path))
+    raise ValueError('接口不存在')
+
+
+def post(db,actor,path,body,db_path,day):
+    if path.startswith('/api/workspace/nurture/'):return nurture.post(db,actor,path,body,day)
+    if path=='/api/account/nurture':
+        started=str(body.get('started',''))
+        if started:date.fromisoformat(started)
+        if started>day:raise ValueError('养号开始日期不能在未来')
+        if not db.execute('SELECT 1 FROM accounts WHERE id=?',(str(body.get('id')),)).fetchone():raise ValueError('账号不存在')
+        db.execute('UPDATE accounts SET nurture_started=? WHERE id=?',(started,str(body['id'])));return dict(ok=True)
+    if path=='/api/publishing/assignment':operations.assignments(db,body,actor['id']);return dict(ok=True)
+    if path.endswith('/import-preview'):
+        rows=data_exchange.read_file(str(body.get('filename','')),body.get('content',''))
+        return data_exchange.plan_import(db,actor,body.get('kind'),rows,day,new_scope={key:body[key] for key in ('office_id','office_ids') if key in body})
+    if path.endswith('/import-apply'):return data_exchange.apply_import(db,actor,body,day)
+    if path.endswith('/backup-now'):
+        target=Path(db_path).parent.parent/'backups'/('manual-'+__import__('datetime').datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.db')
+        backup.snapshot(db_path,target);return dict(ok=True,name=target.name)
+    if path.endswith('/restore-preview'):
+        payload=backup_management.inspect(db,db_path,body.get('backup_id',''));ident=operations.preview(db,actor,'restore',payload)
+        return dict(preview_id=ident,**payload,note='仅恢复业务资料，保留当前登录账号与权限；恢复前再备份当前库，恢复后清空采集任务并暂停采集。')
+    if path.endswith('/restore-apply'):
+        if body.get('confirmation')!='恢复业务数据':raise ValueError('请输入“恢复业务数据”确认')
+        row=db.execute('SELECT password_hash FROM auth_users WHERE id=?',(actor['id'],)).fetchone()
+        if not auth.password_matches(body.get('password'),row['password_hash']):raise ValueError('总管理员密码不正确')
+        payload=operations.take_preview(db,actor,body.get('preview_id'),'restore');result=backup_management.restore(db,db_path,payload)
+        db.execute('DELETE FROM operations_previews');return result
+    if path.endswith('/export'):
+        ids=body.get('ids')
+        if ids is not None and (not isinstance(ids,list) or len(ids)>5000):raise ValueError('导出筛选范围不正确')
+        export_day=str(body.get('date',day));date.fromisoformat(export_day)
+        rows=data_exchange.table_rows(db,body.get('kind'),set(map(str,ids)) if ids is not None else None,body.get('template') is True,export_day,actor=actor)
+        fmt=body.get('format','xlsx')
+        if fmt=='csv':
+            stream=io.StringIO();writer=csv.writer(stream);writer.writerows([["'"+str(value) if str(value).startswith(('=','+','-','@')) else value for value in row] for row in rows]);content=stream.getvalue().encode('utf-8-sig');mime='text/csv;charset=utf-8'
+        elif fmt=='xlsx':
+            try:
+                root=Path(db_path).resolve().parent.parent;folder=root/'artifacts/exports';folder.mkdir(parents=True,exist_ok=True)
+                with tempfile.TemporaryDirectory(dir=folder) as temporary:
+                    source=Path(temporary)/'input.json';target=Path(temporary)/'export.xlsx'
+                    source.write_text(json.dumps(dict(rows=rows),ensure_ascii=False),encoding='utf-8')
+                    worker=root/'artifacts/device-audit/workspace-export.mjs'
+                    if not worker.is_file():worker=Path(__file__).resolve().parent/'artifacts/device-audit/workspace-export.mjs'
+                    try:result=subprocess.run([str(NODE),str(worker),str(source),str(target)],capture_output=True,timeout=EXPORT_WORKER_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:raise ExportTimeout()
+                    if result.returncode:raise ExportFileError()
+                    content=target.read_bytes()
+            except ExportTimeout:raise
+            except OSError:raise ExportFileError()
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        else:raise ValueError('导出格式不正确')
+        return dict(filename=('导入模板' if body.get('template') else '工作台资料')+'.'+fmt,content=base64.b64encode(content).decode(),mime=mime,count=len(rows)-1)
+    raise ValueError('接口不存在')

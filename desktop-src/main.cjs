@@ -1,0 +1,63 @@
+const {app,BrowserWindow,dialog,Menu,shell}=require('electron');
+const {randomBytes}=require('node:crypto');
+const {spawn}=require('node:child_process');
+const path=require('node:path');
+const fs=require('node:fs');
+const root=path.resolve(process.resourcesPath,'..','..');
+app.setName('抖音账号工作台');
+app.setPath('userData',path.join(root,'desktop-profile'));
+app.setAppUserModelId('local.douyin.account.board');
+let child,window,serverOrigin,collectorChild,quitting=false;
+let workerToken=randomBytes(32).toString('hex');
+const gotLock=app.requestSingleInstanceLock();
+if(!gotLock){app.quit();}else{
+app.on('second-instance',()=>{if(window){if(window.isMinimized())window.restore();window.show();window.focus();}});
+function stop(){if(collectorChild&&!collectorChild.killed){spawn('taskkill',['/PID',String(collectorChild.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'});collectorChild=undefined;}if(child&&!child.killed){child.kill();child=undefined;}}
+app.on('before-quit',()=>{quitting=true;stop();});
+app.on('window-all-closed',()=>app.quit());
+function startF2Worker(shared){
+  return; // First release keeps collection disabled, including desktop launch paths.
+  const runtime='E:/douyin-f2-counts/.venv/Scripts/python.exe',script=path.join(root,'f2_worker.py');
+  if(!fs.existsSync(runtime)||!fs.existsSync(script))return;
+  const workerProcess=spawn(runtime,['-X','utf8',script],{cwd:root,windowsHide:true,detached:shared,stdio:'ignore',env:{...process.env,DOUYIN_BOARD_WORKER_ORIGIN:serverOrigin,DOUYIN_BOARD_WORKER_TOKEN:workerToken}});
+  workerProcess.on('error',()=>{});
+  if(shared)workerProcess.unref();else collectorChild=workerProcess;
+}
+async function start(){
+  fs.mkdirSync(path.join(root,'logs'),{recursive:true});
+  const log=fs.createWriteStream(path.join(root,'logs','desktop.log'),{flags:'a'});
+  window=new BrowserWindow({width:1440,height:960,minWidth:920,minHeight:650,show:false,title:'抖音账号工作台',backgroundColor:'#f5f7f5',icon:path.join(__dirname,'board.ico'),webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true,preload:path.join(__dirname,'preload.cjs')}});
+  window.on('closed',()=>app.quit());
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    {label:'工作台',submenu:[{label:'备份账号数据',click:async()=>{const result=await dialog.showSaveDialog(window,{title:'备份账号数据库',defaultPath:path.join(root,'backups','账号数据-'+new Date().toISOString().slice(0,10)+'.db'),filters:[{name:'SQLite 数据库',extensions:['db']}]});if(!result.canceled){fs.mkdirSync(path.dirname(result.filePath),{recursive:true});try{const backup=spawn(path.join(process.resourcesPath,'python','python.exe'),[path.join(process.resourcesPath,'backend','backup.py'),path.join(root,'data','board.db'),result.filePath],{windowsHide:true});backup.on('exit',code=>dialog.showMessageBox(window,{type:code===0?'info':'error',message:code===0?'备份完成':'备份失败，请重试'}));backup.on('error',e=>dialog.showErrorBox('备份失败',e.message));}catch(e){dialog.showErrorBox('备份失败',e.message);}}}},{label:'退出',click:()=>app.quit()}]},
+    {label:'视图',submenu:[{role:'reload'},{role:'resetZoom'},{role:'zoomIn'},{role:'zoomOut'},{role:'togglefullscreen'}]},
+    {label:'帮助',submenu:[{label:'打开数据文件夹',click:()=>shell.openPath(path.join(root,'data'))},{label:'打开自动备份文件夹',click:()=>shell.openPath(path.join(root,'backups','automatic'))},{label:'关于',click:()=>dialog.showMessageBox(window,{type:'info',message:'抖音账号工作台 0.2.0',detail:'每日发布矩阵、人工账号状态与公开作品数量采集。填写真实抖音号或主页。抖音要求验证时需手动完成。'})}]}
+  ]));
+  window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+  window.webContents.on('will-navigate',(event,url)=>{if(!serverOrigin||!url.startsWith(serverOrigin+'/'))event.preventDefault();});
+  window.webContents.session.setPermissionRequestHandler((_wc,_permission,callback)=>callback(false));
+  const sharedConfigPath=path.join(root,'data','web-service.json');
+  if(fs.existsSync(sharedConfigPath)){
+    const shared=JSON.parse(fs.readFileSync(sharedConfigPath,'utf8'));
+    if(shared.enabled){
+      workerToken=shared.worker_token;serverOrigin='http://127.0.0.1:'+shared.port;
+      const response=await fetch(serverOrigin+'/api/health',{signal:AbortSignal.timeout(5000)});
+      const health=await response.json();
+      if(!response.ok||health.service!=='douyin-account-board'||health.shared!==true)throw Error('共享网站服务未运行，请在网站管理中启动 DouyinAccountBoardWeb 任务');
+      // The F2 worker holds a host-wide lock, preventing duplicate consumers.
+      startF2Worker(true);
+      await window.loadURL(serverOrigin+'/login.html');window.show();window.focus();
+      return;
+    }
+  }
+  child=spawn(path.join(process.resourcesPath,'python','python.exe'),['-u',path.join(process.resourcesPath,'backend','desktop_server.py')],{cwd:root,windowsHide:true,env:{...process.env,DOUYIN_BOARD_DATA_DIR:path.join(root,'data'),DOUYIN_BOARD_WORKER_TOKEN:workerToken,PYTHONIOENCODING:'utf-8'}});
+  child.stderr.pipe(log,{end:false});
+  let buffer='',ready=false;
+  const timeout=setTimeout(()=>fail('启动超时，请查看 logs/desktop.log'),20000);
+  const fail=message=>{clearTimeout(timeout);if(quitting)return;dialog.showErrorBox('账号工作台启动失败',message);app.quit();};
+  child.on('error',e=>fail(e.message));
+  child.on('exit',code=>{clearTimeout(timeout);if(!quitting)fail('本地数据服务意外退出（'+code+'）');});
+  child.stdout.on('data',chunk=>{buffer+=chunk.toString();const match=buffer.match(/BOARD_URL=(http:\/\/127\.0\.0\.1:\d+)/);if(match&&!ready){ready=true;clearTimeout(timeout);serverOrigin=match[1];startF2Worker(false);(async()=>{const response=await fetch(serverOrigin+'/api/auth/desktop-setup',{method:'POST',headers:{'Content-Type':'application/json','X-Worker-Token':workerToken},body:'{}'});if(!response.ok)throw Error('初始化登录服务失败');const grant=await response.json();if(grant.setup_token)await window.webContents.session.cookies.set({url:serverOrigin,name:'board_setup',value:grant.setup_token,path:'/',httpOnly:true,sameSite:'strict',expirationDate:Date.now()/1000+1800});await window.loadURL(serverOrigin+'/login.html');window.show();window.focus();})().catch(e=>fail(e.message));}});
+}
+app.whenReady().then(start).catch(e=>{dialog.showErrorBox('启动失败',e.message);app.quit();});
+}

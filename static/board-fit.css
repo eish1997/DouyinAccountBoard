@@ -1,0 +1,22 @@
+/* Fit every publishing column into the desktop viewport without browser zoom. */
+body.board-fit main{max-width:none;padding-left:22px;padding-right:22px}
+body.board-fit #accountWorkspace{min-width:0}
+body.board-fit .matrix-scroll{width:100%;max-width:100%}
+body.board-fit .matrix{width:100%;min-width:0;table-layout:fixed}
+body.board-fit .matrix th:first-child,body.board-fit .matrix td.host{width:116px;min-width:0;padding:10px 8px}
+body.board-fit .matrix th:not(:first-child){padding:10px 4px;white-space:normal;overflow-wrap:anywhere;font-size:11px}
+body.board-fit .matrix td:not(.host){min-width:0;width:auto;padding:6px 4px;vertical-align:top}
+body.board-fit .matrix .account-card{width:100%;min-width:0;max-width:100%;padding:8px 6px;gap:6px;border-radius:7px}
+body.board-fit .matrix .card-top{flex-wrap:wrap;gap:4px;align-items:flex-start}
+body.board-fit .matrix .account-name{flex:1 1 100%;min-width:0;max-width:100%;font-size:11px;line-height:1.55;overflow-wrap:anywhere}
+body.board-fit .matrix .badge{max-width:100%;padding:2px 4px;font-size:10px;white-space:normal;overflow-wrap:anywhere}
+body.board-fit .matrix .card-bottom{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;white-space:normal}
+body.board-fit .matrix .edit-card,body.board-fit .matrix .manual-link-button{grid-column:1/-1;text-align:left}
+body.board-fit .matrix .card-count{min-width:0;font-size:10px;overflow-wrap:anywhere}
+body.board-fit .matrix .publish-toggle{width:100%;min-width:0;padding:5px 2px;font-size:11px;white-space:normal}
+body.board-fit .matrix .text-button{min-width:0;max-width:100%;padding:3px 0;font-size:10px;white-space:normal;overflow-wrap:anywhere}
+body.board-fit .matrix .verification-info{min-width:0;max-width:100%;gap:4px;overflow-wrap:anywhere}
+body.board-fit .matrix .board-batch-pick{min-width:0;gap:3px;font-size:10px;white-space:normal}
+body.board-fit .matrix .unresolved-card small{max-width:100%;font-size:10px;line-height:1.5;overflow-wrap:anywhere}
+body.board-fit .matrix .empty-slot{min-width:0;font-size:10px;text-align:center;overflow-wrap:anywhere}
+@media(max-width:900px){body.board-fit main{padding-left:10px;padding-right:10px}body.board-fit .matrix th:first-child,body.board-fit .matrix td.host{width:84px;padding:8px 4px}}

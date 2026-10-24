@@ -1,0 +1,25 @@
+/* Compact controls for the daily workspace; refreshing these never reloads editors. */
+function collectionPanelText(c){
+  return `${c.worker_online?'采集器在线 · '+c.worker_status:c.worker_status} · ${c.waiting} 个等待或正在采集 · ${c.done} 个成功 / ${c.failed} 个失败`+(c.paused?' · 已暂停：'+c.pause_reason:' · 队列运行中');
+}
+async function refreshCollectionPanel(){
+  try{
+    const response=await fetch('/api/collection/status');
+    if(!response.ok)throw Error(response.status===401?'请登录后查看采集进度':'读取采集进度失败');
+    const result=await response.json(),c=result.collection;
+    document.getElementById('workCollectionInfo').textContent=collectionPanelText(c);
+    document.getElementById('workCollectionPause').disabled=!result.can_manage;
+    document.getElementById('workCollectionResume').disabled=!result.can_manage;
+    document.getElementById('workCollectionResume').hidden=!c.paused&&c.worker_status!=='等待手动登录或验证';
+  }catch(error){document.getElementById('workCollectionInfo').textContent=error.message;}
+}
+async function controlCollectionPanel(body){
+  const errorBox=document.getElementById('workCollectionError');errorBox.textContent='';
+  try{await send('/api/collection/settings',body);await refreshCollectionPanel();}
+  catch(error){errorBox.textContent=error.message;}
+}
+document.getElementById('workCollectionPause').onclick=()=>controlCollectionPanel({pause:true});
+document.getElementById('workCollectionResume').onclick=()=>controlCollectionPanel({resume:true});
+document.getElementById('workCollectionRefresh').onclick=refreshCollectionPanel;
+refreshCollectionPanel();
+setInterval(()=>{if(document.visibilityState==='visible')refreshCollectionPanel();},5000);

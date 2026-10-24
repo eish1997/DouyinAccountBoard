@@ -1,0 +1,18 @@
+const capturedVersions=new Map();
+function versionKeys(path,body,accounts){
+ const id=String(body.id??''),keys=[];
+ if(path==='/api/batch-edit'){const prefix={cards:'card',devices:'device'}[body.kind]||'account';for(const value of body.ids||[]){keys.push(prefix+':'+value);if(body.kind==='verification')keys.push('nurture:'+value);if(body.kind==='daily')keys.push('daily:'+value+':'+body.patch.date);}return keys;}
+ if(path.startsWith('/api/workspace/nurture/'))keys.push('account:'+id,'nurture:'+id);
+ if(['/api/account','/api/account/status','/api/account/card-readiness','/api/lifecycle-status','/api/account/phone-device','/api/account/nurture'].includes(path))keys.push('account:'+id);
+ if(path==='/api/bulk-status')keys.push(...(body.ids||[]).map(id=>'account:'+id));
+ if(path==='/api/daily')keys.push('account:'+id,'daily:'+id+':'+body.date);
+ if(path==='/api/phone-card'&&body.id)keys.push('card:'+id);
+ if(path==='/api/phone-device')keys.push('device:'+id);
+ if(['/api/account','/api/account/create','/api/account/phone-device'].includes(path)&&'phone_device_id' in body){const old=accounts.find(account=>account.id===id);for(const value of [old?.phone_device_id,body.phone_device_id])if(value)keys.push('device:'+value);}
+ if(path==='/api/publishing/assignment')for(const [computer,slot] of [[body.computer_id,body.slot],[body.target_computer,body.target_slot]])if(computer!=null&&slot!=null)keys.push('layout:'+body.batch+':'+computer+':'+slot);
+ return keys;
+}
+function versionPayload(path,body,state,source){return {...body,_expected_versions:Object.fromEntries(versionKeys(path,body,state.accounts).map(key=>[key,(source||state.record_versions||{})[key]??null]))};}
+function captureVersions(id){capturedVersions.set(id,{...(data.record_versions||{})});}
+function activeEditVersions(){for(const id of ['editor','cardEditor','phoneDeviceEditor','publishingMatchDialog','verificationEditor','batchEditor'])if($(id)?.open&&capturedVersions.has(id))return capturedVersions.get(id);return null;}
+function applyVersionDelta(delta,state){if(!delta)return;state.record_versions={...state.record_versions,...delta};for(const snapshot of capturedVersions.values())Object.assign(snapshot,delta);}

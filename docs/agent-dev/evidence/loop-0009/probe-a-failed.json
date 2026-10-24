@@ -1,0 +1,10 @@
+{
+  "kind": "local-postgresql-capability-probe-not-platform-acceptance",
+  "started_utc": "2026-10-21T13:33:20.229343+00:00",
+  "host": "127.0.0.1",
+  "port": 5589,
+  "passed": false,
+  "version": "postgres (PostgreSQL) 16.15",
+  "ended_utc": "2026-10-21T13:33:32.269410+00:00",
+  "server_stopped": true
+}

@@ -1,0 +1,22 @@
+[
+  {
+    "path": "pg_synthetic_migration.py",
+    "sha256": "7AB3D6362DC0575AD4F1149FE4A48C2E85B04C408392C1DC3589663D831B5312"
+  },
+  {
+    "path": "pg_migration_checks.py",
+    "sha256": "317F7F70BD6A69568F06905AF4773BC7245CBE3FB58FA1B7D0C89570E9059778"
+  },
+  {
+    "path": "probe_postgresql.py",
+    "sha256": "BFDD6EB06F4E0CEA735AC85C400A4442CA56296CD4729F48CA51E4FC4A424D8F"
+  },
+  {
+    "path": "migrations/postgresql/0001_legacy_baseline.sql",
+    "sha256": "7F5E833E7137371D14B60054E3B8C6364C0DB7A941E348612C176B31C9360AA9"
+  },
+  {
+    "path": "migrations/postgresql/legacy-sqlite-schema.json",
+    "sha256": "7E2F0310723FA0349BDA0ED76B38F3CD55806B00A0997B6EC11D8F3A5ED0FF35"
+  }
+]

@@ -1,0 +1,17 @@
+.venv/
+.venv-release/
+.local-tools/
+.synthetic-tests/
+data/
+backups/
+logs/
+desktop/
+desktop-profile/
+artifacts/
+agent_memory/
+__pycache__/
+*.py[cod]
+*.db
+.env
+.env.*
+node_modules/

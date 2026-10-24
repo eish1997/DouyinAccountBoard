@@ -1,0 +1,23 @@
+{
+  "kind": "local-postgresql-capability-probe-not-platform-acceptance",
+  "started_utc": "2026-10-21T14:07:43.729882+00:00",
+  "host": "127.0.0.1",
+  "port": 12125,
+  "passed": false,
+  "version": "postgres (PostgreSQL) 16.15",
+  "protocol": {
+    "kind": "protocol-primitives-not-http-acceptance",
+    "passed": true,
+    "checks": [
+      "barrier-CAS-one-winner",
+      "audit-ownership",
+      "observed-lock-wait-revocation",
+      "admitted-writer-before-revocation",
+      "old-writer-epoch",
+      "old-restore-generation",
+      "maintenance-across-connections"
+    ]
+  },
+  "ended_utc": "2026-10-21T14:08:11.729595+00:00",
+  "server_stopped": true
+}

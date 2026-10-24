@@ -1,0 +1,187 @@
+--- app.py.before
++++ app.py
+@@ -18,6 +18,7 @@
+ import account_service
+ import workspace_service
+ import nurture
++from release_policy import COLLECTION_MESSAGE
+ 
+ ROOT = Path(__file__).resolve().parent
+ DB = Path(os.environ['DOUYIN_BOARD_DATA_DIR']) / 'board.db' if os.environ.get('DOUYIN_BOARD_DATA_DIR') else None
+@@ -88,9 +89,7 @@
+         operations.migrate(db)
+         nurture.migrate(db)
+         nurture.sync(db,today())
+-        # A desktop restart may leave a claimed job whose previous browser no longer exists.
+-        db.execute("UPDATE accounts SET collection_state='等待采集' WHERE id IN (SELECT account_id FROM collection_jobs WHERE state='running')")
+-        db.execute("UPDATE collection_jobs SET state='queued' WHERE state='running'")
++        # Collection is disabled; retained task states are historical, not executable leases.
+ 
+ class Handler(SimpleHTTPRequestHandler):
+     def __init__(self, *args, **kwargs):
+@@ -109,6 +108,8 @@
+ 
+     def do_GET(self):
+         parsed = urlparse(self.path)
++        if parsed.path.startswith('/api/collection/') and parsed.path != '/api/collection/status':
++            return self.reply({'error': COLLECTION_MESSAGE, 'code': 'COLLECTION_DISABLED'}, 503)
+         if parsed.path=='/api/nurture/image':
+             with connect() as db:
+                 actor=auth.session(db,self.headers.get('Cookie'))
+@@ -129,7 +130,7 @@
+             with connect() as db:
+                 actor=auth.session(db,self.headers.get('Cookie'))
+                 if not actor:return self.reply({'error':'请先登录工作台'},401)
+-                return self.reply({'collection':collection.overview(db),'can_manage':'collection_manage' in actor['permissions']})
++                return self.reply({'collection':collection.overview(db),'can_manage':False})
+         if parsed.path=='/api/auth/me':
+             with connect() as db:
+                 user=auth.session(db,self.headers.get('Cookie'))
+@@ -218,6 +219,8 @@
+             raise auth.AccessError('接口不存在',404)
+ 
+     def do_POST(self):
++        if urlparse(self.path).path.startswith('/api/collection/'):
++            return self.reply({'error': COLLECTION_MESSAGE, 'code': 'COLLECTION_DISABLED'}, 503)
+         # Same-origin writes only; local services must not accept cross-site form submissions.
+         origin = self.headers.get('Origin')
+         configured_origin=os.environ.get('DOUYIN_BOARD_PUBLIC_ORIGIN','').rstrip('/')
+--- collection.py.before
++++ collection.py
+@@ -2,6 +2,7 @@
+ import re
+ import secrets
+ import time
++from release_policy import require_collection, COLLECTION_MESSAGE
+ from datetime import datetime, timezone, timedelta
+ from urllib.parse import urlparse
+ 
+@@ -33,6 +34,7 @@
+     db.execute('INSERT OR IGNORE INTO collection_worker(id) VALUES(1)')
+ 
+ def enqueue(db, ids):
++    require_collection()
+     queued=0;missing=0
+     for account_id in dict.fromkeys(str(i) for i in ids):
+         a=db.execute('SELECT * FROM accounts WHERE id=?',(account_id,)).fetchone()
+@@ -48,6 +50,7 @@
+     return dict(queued=queued,missing=missing)
+ 
+ def next_job(db,day):
++    require_collection()
+     settings=db.execute('SELECT * FROM collection_settings WHERE id=1').fetchone()
+     if settings['paused']:
+         return None
+@@ -69,6 +72,7 @@
+     return dict(job)
+ 
+ def complete(db,body):
++    require_collection()
+     job=db.execute("SELECT j.*,a.homepage AS current_homepage,a.douyin_id AS current_douyin_id FROM collection_jobs j JOIN accounts a ON a.id=j.account_id WHERE j.account_id=? AND j.token=? AND j.state='running'",(str(body['account_id']),body['token'])).fetchone()
+     if not job:
+         return dict(ignored=True)
+@@ -100,6 +104,7 @@
+     return dict(ok=True)
+ 
+ def heartbeat(db, status):
++    require_collection()
+     allowed={'待命','正在采集','等待手动登录或验证','采集器异常'}
+     if status not in allowed:raise ValueError('采集器状态不正确')
+     row=db.execute('SELECT command FROM collection_worker WHERE id=1').fetchone()
+@@ -115,4 +120,5 @@
+     settings['worker_status']=worker['status'] if settings['worker_online'] else '采集器离线：请在服务器电脑登录 Windows'
+     settings['done']=db.execute("SELECT count(*) FROM accounts WHERE collection_state='采集成功'").fetchone()[0]
+     settings['failed']=db.execute("SELECT count(*) FROM accounts WHERE collection_state IN ('采集失败','需要验证')").fetchone()[0]
++    settings.update(enabled=False, worker_online=False, worker_status=COLLECTION_MESSAGE)
+     return settings
+--- f2_worker.py.before
++++ f2_worker.py
+@@ -7,6 +7,7 @@
+ from pathlib import Path
+ from urllib.request import Request, build_opener, ProxyHandler
+ from urllib.error import HTTPError
++from release_policy import require_collection
+ 
+ ROOT=Path(__file__).resolve().parent
+ RUNTIME=Path('E:/douyin-f2-counts/.venv/Scripts/python.exe')
+@@ -34,6 +35,7 @@
+ 
+ class Worker:
+     def __init__(self):
++        require_collection()
+         if os.environ.get('DOUYIN_BOARD_WORKER_ORIGIN'):
+             self.origin=os.environ['DOUYIN_BOARD_WORKER_ORIGIN']
+             from urllib.parse import urlparse
+@@ -117,6 +119,7 @@
+             time.sleep(3)
+ 
+ def main():
++    require_collection()
+     # One consumer per host, including when a desktop client is also open.
+     import msvcrt
+     lock_path=ROOT/'data/f2-worker.lock'
+--- start_f2_worker.ps1.before
++++ start_f2_worker.ps1
+@@ -1,4 +1,5 @@
+ $ErrorActionPreference = 'Stop'
++throw '采集暂未启用；本版本禁止启动Worker，已有记录保留。'
+ $runtimePath = 'E:\douyin-f2-counts\.venv\Scripts\pythonw.exe'
+ if (-not (Test-Path -LiteralPath $runtimePath)) { throw 'F2运行环境不存在，请检查E盘' }
+ Start-Process -FilePath $runtimePath -ArgumentList ('"{0}"' -f (Join-Path $PSScriptRoot 'f2_worker.py')) -WorkingDirectory $PSScriptRoot -WindowStyle Hidden
+--- static/collection-panel.js.before
++++ static/collection-panel.js
+@@ -1,5 +1,6 @@
+ /* Compact controls for the daily workspace; refreshing these never reloads editors. */
+ function collectionPanelText(c){
++  if(c.enabled===false)return '采集暂未启用 · 历史数量、错误和任务记录保留';
+   return `${c.worker_online?'采集器在线 · '+c.worker_status:c.worker_status} · ${c.waiting} 个等待或正在采集 · ${c.done} 个成功 / ${c.failed} 个失败`+(c.paused?' · 已暂停：'+c.pause_reason:' · 队列运行中');
+ }
+ async function refreshCollectionPanel(){
+@@ -8,8 +9,8 @@
+     if(!response.ok)throw Error(response.status===401?'请登录后查看采集进度':'读取采集进度失败');
+     const result=await response.json(),c=result.collection;
+     document.getElementById('workCollectionInfo').textContent=collectionPanelText(c);
+-    document.getElementById('workCollectionPause').disabled=!result.can_manage;
+-    document.getElementById('workCollectionResume').disabled=!result.can_manage;
++    document.getElementById('workCollectionPause').disabled=c.enabled===false||!result.can_manage;
++    document.getElementById('workCollectionResume').disabled=c.enabled===false||!result.can_manage;
+     document.getElementById('workCollectionResume').hidden=!c.paused&&c.worker_status!=='等待手动登录或验证';
+   }catch(error){document.getElementById('workCollectionInfo').textContent=error.message;}
+ }
+--- static/auth-ui.js.before
++++ static/auth-ui.js
+@@ -8,7 +8,12 @@
+  for(const [id,key] of [['applyBulk','account_status'],['bulkStatus','account_status'],['pauseCollect','collection_manage'],['cancelCollect','collection_manage'],['collectSelected','collection_manage'],['collectVisible','collection_manage'],['autoCollect','collection_manage'],['resumeCollect','collection_manage'],['openCollector','collection_manage']])$(id).disabled=!hasPermission(key);
+  $('importCards').disabled=!hasPermission('card_import')||!data.phone_cards?.importable;
+  for(const button of document.querySelectorAll('[data-publish]'))button.disabled=!hasPermission('publish');
+- for(const button of document.querySelectorAll('[data-collect]'))button.disabled=!hasPermission('collection_manage');
++ for(const button of document.querySelectorAll('[data-collect]'))button.disabled=data.collection?.enabled===false||!hasPermission('collection_manage');
++ if(data.collection?.enabled===false){
++   for(const id of ['pauseCollect','cancelCollect','collectSelected','collectVisible','autoCollect','resumeCollect','openCollector'])$(id).disabled=true;
++   $('autoCollect').checked=false;
++   $('collectionInfo').textContent='采集暂未启用 · 已有数量、时间、错误和任务记录保留';
++ }
+  if(!hasPermission('account_progress'))for(const select of document.querySelectorAll('[data-aux-status],[data-readiness-id]'))select.disabled=true;
+ }
+ function applyAccountPermissions(account){
+--- static/index.html.before
++++ static/index.html
+@@ -6,7 +6,7 @@
+ <section class="collection-bar" id="collectionBar"><div><strong>公开作品数量</strong><p id="collectionInfo">正在读取采集设置</p></div><div class="collection-actions"><label><input type="checkbox" id="autoCollect"> 每日自动采集</label><button id="openCollector" class="button">服务器采集浏览器 / 登录</button><button id="resumeCollect" class="button" hidden>继续采集</button><button id="pauseCollect" class="button">暂停队列</button><button id="cancelCollect" class="button">清空等待任务</button><button id="collectVisible" class="button primary">采集筛选账号</button></div></section><section id="lifecycleSummary" class="lifecycle-summary" hidden></section><section class="workspace" id="accountWorkspace"><div class="toolbar"><label class="field-search">登录手机序号<input id="accountDeviceQuery" placeholder="精确序号，例如29" autocomplete="off"></label><input type="hidden" id="accountIdQuery" value=""><label class="field-search">账号昵称<input id="query" placeholder="只搜索昵称" autocomplete="off"></label><label class="field-search">真实抖音号<input id="accountDouyinQuery" placeholder="输入完整抖音号" autocomplete="off"></label><label class="field-search">注册手机号<input id="accountPhoneQuery" placeholder="输入完整手机号" autocomplete="off"></label><select id="computer"><option value="">全部电脑</option></select><select id="status"><option value="">全部账号状态</option></select><select id="verificationFilter" aria-label="账号核对情况"><option value="">全部核对情况</option></select><select id="loginPhoneFilter" aria-label="账号登录手机"><option value="">全部登录手机</option></select><select id="published"><option value="">全部发布情况</option><option value="yes">已发</option><option value="no">未发</option></select><select id="accountType"><option value="">全部账号类型</option><option>大号</option><option>小号</option><option>待确认</option></select><select id="ageFilter"><option value="">全部注册天数</option><option value="mature">大号满30天</option><option value="young">大号未满30天</option><option value="missing">大号日期待补充</option></select><select id="lifecycleFilter"><option value="">全部注册进度</option></select><button id="newAccount" class="button">新增账号 / 小号</button><button id="clear" class="text-button">重置</button><button id="refresh" class="button">刷新</button><button id="exportVisibleAccounts" type="button" class="button">导出当前账号</button></div><p class="search-help">输入即筛选，每栏只搜索对应字段；多项条件同时满足才显示。数字手机序号精确匹配，办公室及其他筛选仍然有效。</p>
+ <div class="panel-heading"><div><h2 id="panelTitle">主机发布矩阵</h2><span id="scope"></span></div><div class="legend"><i class="green-dot"></i>已发 <i class="gray-dot"></i>未发 <i class="amber-dot"></i>异常账号</div></div>
+ <div id="boardView"><div id="batchBoardBar" class="batch-toolbar"></div><div class="pending-review-entry"><button type="button" class="button" id="pendingReviewToggle" aria-expanded="false" aria-controls="pendingReviewPanel">待匹配分类处理</button></div><section id="pendingReviewPanel" class="pending-review-panel" hidden><h2>待匹配发布格 · 逐条确认</h2><p id="pendingReviewSummary"></p><div class="toolbar"><label class="field-search">处理办公室<select id="pendingReviewOffice"><option value="all">全部办公室</option><option value="one">办公室一</option><option value="two">办公室二</option><option value="three">办公室三</option></select></label><label class="field-search">待匹配原因<select id="pendingReviewReason"><option value="all">全部待匹配</option></select></label><label class="field-search">原表格子<input id="pendingReviewCell" placeholder="精确格子，例如K11" autocomplete="off"></label><button class="button" id="pendingReviewReset" type="button">重置处理筛选</button></div><div class="account-scroll"><table class="pending-review-table"><thead><tr><th>位置 / 手机</th><th>原表内容</th><th>原因分类</th><th>候选账号 / 判断依据</th><th>操作</th></tr></thead><tbody id="pendingReviewRows"></tbody></table></div><div class="pending-review-pagination"><button type="button" class="button" id="pendingReviewPrevious">上一页待匹配</button><span id="pendingReviewPage"></span><button type="button" class="button" id="pendingReviewNext">下一页待匹配</button></div></section><div class="matrix-scroll"><table class="matrix"><thead id="matrixHead"></thead><tbody id="matrixBody"></tbody></table></div><div class="footnote">点击“未发 / 已发”切换记录；账号状态独立保存。空位表示该电脑尚未导入账号。</div></div>
+-<div id="accountsView" hidden><div id="batchAccountsBar" class="batch-toolbar"></div><div class="bulk"><span id="selectedCount">已选择 0 个账号</span><select id="bulkStatus"></select><button id="applyBulk" class="button">批量更新状态</button><button id="collectSelected" class="button">采集所选账号</button></div><div class="account-scroll"><table class="account-table"><thead><tr><th><input id="selectAll" type="checkbox" aria-label="全选筛选中的账号"></th><th>账号</th><th>所属电脑</th><th>账号类型 / 注册进度</th><th>账号状态</th><th>核对情况</th><th>当天发布</th><th>公开作品数</th><th>备注</th><th>操作</th></tr></thead><tbody id="accountsBody"></tbody></table></div><div class="footnote">填写真实抖音号即可搜索对应主页，只有抖音号完全一致才自动绑定。采集器在服务器电脑登录 Windows 后运行，结果全员共享。遇登录或安全验证会暂停，请在服务器采集浏览器按暂停提示的抖音号搜索、手动完成验证，再点击“继续采集”；失败保留上次成功数量和时间。</div></div></section>
++<div id="accountsView" hidden><div id="batchAccountsBar" class="batch-toolbar"></div><div class="bulk"><span id="selectedCount">已选择 0 个账号</span><select id="bulkStatus"></select><button id="applyBulk" class="button">批量更新状态</button><button id="collectSelected" class="button">采集所选账号</button></div><div class="account-scroll"><table class="account-table"><thead><tr><th><input id="selectAll" type="checkbox" aria-label="全选筛选中的账号"></th><th>账号</th><th>所属电脑</th><th>账号类型 / 注册进度</th><th>账号状态</th><th>核对情况</th><th>当天发布</th><th>公开作品数</th><th>备注</th><th>操作</th></tr></thead><tbody id="accountsBody"></tbody></table></div><div class="footnote">采集暂未启用。已有作品数量、采集时间、错误和历史任务继续保留供核对；人工发布登记照常使用。</div></div></section>
+ <section class="workspace" id="cardsWorkspace" hidden>
+  <div class="toolbar"><label class="field-search">卡位置 / 手机序号<input id="cardLocationQuery" placeholder="数字序号精确匹配" autocomplete="off"></label><label class="field-search">手机卡号码<input id="cardQuery" placeholder="只搜索号码" autocomplete="off"></label><label class="field-search">卡主 / 提供人<input id="cardOwnerQuery" placeholder="只搜索卡主" autocomplete="off"></label><label class="field-search">卡编号 / 名称<input id="cardLabelQuery" placeholder="只搜索卡名称" autocomplete="off"></label><label class="field-search">关联账号昵称<input id="cardAccountNameQuery" placeholder="只搜索关联昵称" autocomplete="off"></label><select id="cardStatus" aria-label="手机卡状态"><option value="">全部手机卡状态</option></select><select id="cardCarrier" aria-label="运营商"><option value="">全部运营商</option></select><select id="cardLinked" aria-label="账号关联情况"><option value="">全部关联情况</option><option value="yes">已关联账号</option><option value="no">未关联账号</option></select><select id="cardExpiry" aria-label="手机卡到期情况"><option value="">全部到期情况</option><option value="soon">7天内到期 / 已到期</option><option value="missing">未填到期日</option></select><select id="cardTask" aria-label="手机卡处理事项"><option value="">全部处理事项</option><option value="cancel">手机卡待注销</option><option value="code">待接码</option><option value="return">待归还</option><option value="blocked">关联账号有封禁</option><option value="ready">稳定改密条件已记录</option><option value="review">源资料待核对</option></select><button id="newCard" class="button primary">新增手机卡</button><button id="importCards" class="button">从账号手机号补录</button><button id="clearCards" class="text-button">重置</button><button id="refreshCards" class="button">刷新</button></div><p class="search-help">输入即筛选，每栏只搜索对应字段；多项条件同时满足才显示。数字手机序号精确匹配，办公室及其他筛选仍然有效。</p>
+  <div class="panel-heading"><div><h2>手机卡清单</h2><span id="cardsScope"></span></div></div>
+--- desktop-src/main.cjs.before
++++ desktop-src/main.cjs
+@@ -16,6 +16,7 @@
+ app.on('before-quit',()=>{quitting=true;stop();});
+ app.on('window-all-closed',()=>app.quit());
+ function startF2Worker(shared){
++  return; // First release keeps collection disabled, including desktop launch paths.
+   const runtime='E:/douyin-f2-counts/.venv/Scripts/python.exe',script=path.join(root,'f2_worker.py');
+   if(!fs.existsSync(runtime)||!fs.existsSync(script))return;
+   const workerProcess=spawn(runtime,['-X','utf8',script],{cwd:root,windowsHide:true,detached:shared,stdio:'ignore',env:{...process.env,DOUYIN_BOARD_WORKER_ORIGIN:serverOrigin,DOUYIN_BOARD_WORKER_TOKEN:workerToken}});

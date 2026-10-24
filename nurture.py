@@ -1,0 +1,158 @@
+"""Seven-day registration nurturing, durable due queue and database-backed evidence."""
+import base64
+import secrets
+import json
+from datetime import date,timedelta
+import auth
+
+VERIFICATION=['待检查','无需核对，可使用','核对处理中','核对已通过']
+READY={'无需核对，可使用','核对已通过'}
+USABLE={'正常','待确认','养号7天'}
+
+def migrate(db):
+    db.executescript('''CREATE TABLE IF NOT EXISTS nurture_records(
+      account_id TEXT PRIMARY KEY REFERENCES accounts(id),started_on TEXT NOT NULL DEFAULT '',
+      completed_on TEXT NOT NULL DEFAULT '',cycle INTEGER NOT NULL DEFAULT 1,
+      image_count INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS nurture_images(id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts(id),cycle INTEGER NOT NULL,day TEXT NOT NULL,
+      mime TEXT NOT NULL,content BLOB NOT NULL,actor TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS nurture_image_account ON nurture_images(account_id,cycle);''')
+    columns={r[1] for r in db.execute('PRAGMA table_info(nurture_records)')}
+    additions={'verification_state':"TEXT NOT NULL DEFAULT '待检查'",'verification_owner':"TEXT NOT NULL DEFAULT ''",
+               'verification_note':"TEXT NOT NULL DEFAULT ''",'verification_updated_on':"TEXT NOT NULL DEFAULT ''",
+               'workflow':"TEXT NOT NULL DEFAULT '待开始'",'active_since':"TEXT NOT NULL DEFAULT ''",
+               'banked_days':'INTEGER NOT NULL DEFAULT 0','paused_on':"TEXT NOT NULL DEFAULT ''",
+               'periods':"TEXT NOT NULL DEFAULT '[]'",'legacy_started_on':"TEXT NOT NULL DEFAULT ''"}
+    for field,definition in additions.items():
+        if field not in columns:db.execute('ALTER TABLE nurture_records ADD COLUMN '+field+' '+definition)
+    if 'workflow' not in columns:
+        # Prior dates were inferred from registration; they are evidence to confirm,
+        # never proof of a passed check or of seven usable nurturing days.
+        db.execute("UPDATE nurture_records SET legacy_started_on=started_on,started_on=CASE WHEN completed_on='' THEN '' ELSE started_on END,workflow=CASE WHEN completed_on='' THEN '待开始' ELSE '已结束' END")
+
+def elapsed(record,today):
+    return record['banked_days']+(max(0,(date.fromisoformat(today)-date.fromisoformat(record['active_since'])).days) if record['workflow']=='运行' and record['active_since'] else 0)
+
+def pause(db,record,today):
+    periods=json.loads(record['periods'])
+    periods.append(dict(start=record['active_since'],end=today))
+    db.execute("UPDATE nurture_records SET banked_days=?,periods=?,active_since='',paused_on=?,workflow='暂停',revision=revision+1 WHERE account_id=?",
+               (elapsed(record,today),json.dumps(periods),today,record['account_id']))
+
+def usable(account):
+    if account['status'] not in USABLE:raise ValueError('账号状态异常或停用，请先在账号管理核对状态')
+
+def sync(db,today,account_ids=None):
+    """Keep due records until explicitly completed; never reset completion on a read."""
+    for account in db.execute('SELECT id,status,registered_on,nurture_started FROM accounts').fetchall():
+        if account_ids is not None and account['id'] not in account_ids:continue
+        record=db.execute('SELECT * FROM nurture_records WHERE account_id=?',(account['id'],)).fetchone()
+        started=account['nurture_started'] or account['registered_on']
+        recent=bool(started and 0<=(date.fromisoformat(today)-date.fromisoformat(started)).days<7)
+        if not record and (account['status']=='养号7天' or recent):
+            db.execute('INSERT INTO nurture_records(account_id,legacy_started_on) VALUES(?,?)',(account['id'],started))
+        elif record and not record['completed_on'] and record['workflow']=='待开始' and record['started_on']:
+            db.execute("UPDATE nurture_records SET legacy_started_on=started_on,started_on='',revision=revision+1 WHERE account_id=?",(account['id'],))
+        elif record and not record['completed_on'] and record['workflow']=='运行' and account['status'] not in USABLE:
+            pause(db,record,today)
+            db.execute("UPDATE nurture_records SET verification_state='待检查',verification_updated_on=? WHERE account_id=?",(today,account['id']))
+
+def overview(db,today,allowed_accounts=None):
+    result=[]
+    for row in db.execute('SELECT * FROM nurture_records'):
+        if allowed_accounts is not None and row['account_id'] not in allowed_accounts:continue
+        item=dict(row);start=item['started_on']
+        days=elapsed(item,today)
+        status=db.execute('SELECT status FROM accounts WHERE id=?',(item['account_id'],)).fetchone()[0]
+        stage=('已结束' if item['completed_on'] else '状态待核对' if status not in USABLE else
+               '养号暂停' if item['workflow']=='暂停' else '核对处理中' if item['verification_state']=='核对处理中' else
+               '待检查' if item['verification_state']=='待检查' else '待开始养号' if item['workflow']=='待开始' else
+               '到期待转发布' if days>=7 else '养号中')
+        due=(date.fromisoformat(item['active_since'])+timedelta(days=max(0,7-item['banked_days']))).isoformat() if item['workflow']=='运行' else ''
+        day_dates=[]
+        for period in json.loads(item['periods']):
+            day=date.fromisoformat(period['start']);end=date.fromisoformat(period['end'])
+            while day<end and len(day_dates)<7:day_dates.append(day.isoformat());day+=timedelta(days=1)
+        if item['active_since']:
+            day=date.fromisoformat(item['active_since'])
+            while len(day_dates)<7:day_dates.append(day.isoformat());day+=timedelta(days=1)
+        item.update(elapsed=days,remaining_days=max(0,7-days),due_on=due,stage=stage,day_dates=day_dates)
+        item['images']=[dict(r) for r in db.execute('SELECT id,day,actor FROM nurture_images WHERE account_id=? AND cycle=? ORDER BY day,id',(item['account_id'],item['cycle']))]
+        item['past_images']=[dict(r) for r in db.execute('SELECT id,day,actor,cycle FROM nurture_images WHERE account_id=? AND cycle<>? ORDER BY cycle,day,id',(item['account_id'],item['cycle']))]
+        result.append(item)
+    return dict(records=result,today=today,verification_states=VERIFICATION)
+
+def post(db,actor,path,body,today):
+    if getattr(db,'scope_enabled',False):
+        import office_scope
+        office_scope.require_entity(db,actor,'accounts',str(body.get('id','')),write=True)
+    ident=str(body.get('id',''));record=db.execute('SELECT * FROM nurture_records WHERE account_id=?',(ident,)).fetchone()
+    account=db.execute('SELECT * FROM accounts WHERE id=?',(ident,)).fetchone()
+    if not account:raise ValueError('账号不存在')
+    if path.endswith('/join'):
+        if record and not record['completed_on']:raise ValueError('账号已在养号面板')
+        if record:db.execute("UPDATE nurture_records SET legacy_started_on='',started_on='',completed_on='',cycle=cycle+1,image_count=0,verification_state='待检查',verification_owner='',verification_note='',verification_updated_on='',workflow='待开始',active_since='',banked_days=0,paused_on='',periods='[]',revision=revision+1 WHERE account_id=?",(ident,))
+        else:db.execute('INSERT INTO nurture_records(account_id) VALUES(?)',(ident,))
+        return dict(ok=True)
+    if path.endswith('/purge'):
+        if not record or not record['completed_on']:raise ValueError('请先结束本轮养号，再清理本轮截图')
+        db.execute('DELETE FROM nurture_images WHERE account_id=?',(ident,))
+        db.execute('UPDATE nurture_records SET image_count=0,revision=revision+1 WHERE account_id=?',(ident,))
+        return dict(ok=True)
+    if path.endswith('/verification') and not record:
+        db.execute('INSERT INTO nurture_records(account_id) VALUES(?)',(ident,))
+        record=db.execute('SELECT * FROM nurture_records WHERE account_id=?',(ident,)).fetchone()
+    if (not record or record['completed_on']) and not path.endswith('/verification'):raise ValueError('该账号没有进行中的养号记录')
+    if path.endswith('/verification'):
+        state=body.get('verification_state',record['verification_state'])
+        if state not in VERIFICATION:raise ValueError('核对情况不正确')
+        owner=str(body.get('verification_owner',record['verification_owner'])).strip()
+        note=str(body.get('verification_note',record['verification_note'])).strip()
+        if len(owner)>100 or len(note)>2000:raise ValueError('负责人最多100字，处理备注最多2000字')
+        if state not in READY and not record['completed_on'] and record['workflow']=='运行':pause(db,record,today)
+        db.execute('UPDATE nurture_records SET verification_state=?,verification_owner=?,verification_note=?,verification_updated_on=?,revision=revision+1 WHERE account_id=?',(state,owner,note,today,ident))
+    elif path.endswith('/start'):
+        auth.require(actor,'account_status');usable(account)
+        if record['verification_state'] not in READY:raise ValueError('请先确认无需核对可使用，或核对已通过')
+        if record['workflow']!='待开始':raise ValueError('本轮已经开始；暂停后请使用继续养号，不能重置已完成时间')
+        started=str(body.get('started') or today);date.fromisoformat(started)
+        if started>today:raise ValueError('开始日期不能在未来')
+        if account['registered_on'] and started<account['registered_on']:raise ValueError('实际开始日期不能早于注册日期')
+        db.execute("UPDATE accounts SET nurture_started=?,status='养号7天' WHERE id=?",(started,ident))
+        db.execute("UPDATE nurture_records SET started_on=?,active_since=?,workflow='运行',revision=revision+1 WHERE account_id=?",(started,started,ident))
+    elif path.endswith('/pause'):
+        if record['workflow']!='运行':raise ValueError('只有进行中的养号可以暂停')
+        pause(db,record,today)
+    elif path.endswith('/resume'):
+        auth.require(actor,'account_status');usable(account)
+        if record['workflow']!='暂停':raise ValueError('只有暂停的养号可以继续')
+        if record['verification_state'] not in READY:raise ValueError('请先确认账号已能正常使用，再继续养号')
+        db.execute("UPDATE accounts SET status='养号7天' WHERE id=?",(ident,))
+        db.execute("UPDATE nurture_records SET active_since=?,workflow='运行',revision=revision+1 WHERE account_id=?",(today,ident))
+    elif path.endswith('/upload'):
+        if not record['started_on'] or record['workflow'] not in ['运行','暂停']:raise ValueError('请先确认实际开始养号，再提交养号截图')
+        if record['image_count']>=35:raise ValueError('每轮养号最多保存35张截图')
+        day=str(body.get('day',''));date.fromisoformat(day)
+        if day>today or (record['started_on'] and day<record['started_on']):raise ValueError('截图日期需在开始日期至今天之间')
+        try:content=base64.b64decode(body.get('content',''),validate=True)
+        except Exception:raise ValueError('图片内容无效')
+        if not 0<len(content)<=4*1024*1024:raise ValueError('单张截图最多4MB')
+        mime='image/png' if content.startswith(b'\x89PNG\r\n\x1a\n') else 'image/jpeg' if content.startswith(b'\xff\xd8\xff') else 'image/webp' if content[:4]==b'RIFF' and content[8:12]==b'WEBP' else ''
+        if not mime:raise ValueError('仅支持PNG、JPEG和WebP截图')
+        db.execute('INSERT INTO nurture_images VALUES(?,?,?,?,?,?,?)',(secrets.token_hex(16),ident,record['cycle'],day,mime,content,actor['name']))
+        db.execute('UPDATE nurture_records SET image_count=image_count+1,revision=revision+1 WHERE account_id=?',(ident,))
+    elif path.endswith('/delete-image'):
+        removed=db.execute('DELETE FROM nurture_images WHERE id=? AND account_id=? AND cycle=?',(str(body.get('image_id','')),ident,record['cycle'])).rowcount
+        if not removed:raise ValueError('截图不存在或不属于本轮养号')
+        db.execute('UPDATE nurture_records SET image_count=image_count-1,revision=revision+1 WHERE account_id=?',(ident,))
+    elif path.endswith('/finish'):
+        auth.require(actor,'account_status')
+        usable(account)
+        if record['workflow']!='运行' or record['verification_state'] not in READY:raise ValueError('请先解决核对并继续养号，才能确认结束')
+        if elapsed(record,today)<7:raise ValueError('实际养号尚未满7天，暂停时间不计入')
+        db.execute("UPDATE accounts SET status='正常' WHERE id=?",(ident,))
+        periods=json.loads(record['periods']);periods.append(dict(start=record['active_since'],end=today))
+        db.execute("UPDATE nurture_records SET completed_on=?,workflow='已结束',banked_days=?,active_since='',periods=?,revision=revision+1 WHERE account_id=?",(today,elapsed(record,today),json.dumps(periods),ident))
+    else:raise ValueError('养号操作不存在')
+    return dict(ok=True)

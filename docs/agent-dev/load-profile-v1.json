@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "source": "第一版上线实施计划 v1.1 第七节",
+  "seed": 20261021,
+  "data": {"accounts": 2000, "cards": 1200, "phones": 1000, "computers": 150, "publishing_cells": 1500, "daily_history": 180000, "operation_history": 200000, "offices": 3},
+  "users": {"steady": 50, "peak": 75, "steady_roles": {"admin": 2, "employee": 38, "viewer": 10}, "dual_office_employees": 6, "peak_extra_roles": {"employee": 20, "viewer": 5}, "no_scope_and_unauthorized_cases_separate": true},
+  "timing_seconds": {"ramp_to_50": 300, "steady": 3600, "endurance": 7200, "ramp_50_to_75": 120, "peak_hold": 900, "return_to_50_observe": 600},
+  "reads": {"poll_seconds": 5, "uniform_phase": true, "separate_synchronized_phase_case": true},
+  "writes": {"steady_editors": 10, "peak_editors": 15, "interval_seconds": 20, "simultaneous_saves": 10, "mix": {"account": 0.4, "card_or_device": 0.2, "daily": 0.3, "create": 0.1}, "distributed_ratio": 0.9, "hotspot_ratio": 0.1, "unique_request_ids": true},
+  "large_operations": {"every_seconds": 300, "overlap_start": true, "batch_rows": 100, "import_rows": 500, "export_rows": 2000},
+  "images": {"upload_users": 3, "upload_interval_seconds": 60, "read_users": 10, "read_interval_seconds": 30, "distribution_mib": [{"ratio": 0.8, "size": 0.2}, {"ratio": 0.15, "size": 0.8}, {"ratio": 0.05, "size": 2.0}], "valid_images_required": true, "report_actual_bytes_mean_and_p95": true},
+  "limits_seconds": {"read_p95": 2, "save_p95": 3, "batch": 10, "import_preview": 30, "import_apply": 30, "export_complete_download": 30, "image_upload_p95": 5, "boundary_import_export_provisional": 90},
+  "correctness": {"unexpected_failure_ratio_less_than": 0.005, "integrity_errors_allowed": 0, "expected_403_409_separate": true, "audit_and_idempotency_continuously_checked": true, "relogin_after_test": true},
+  "recovery": {"rpo_seconds": 3600, "rto_seconds": 14400},
+  "status": "frozen_input_only_not_executed",
+  "platform_version_and_resources": null
+}

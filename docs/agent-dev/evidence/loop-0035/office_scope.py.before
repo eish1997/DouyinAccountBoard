@@ -1,0 +1,321 @@
+"""Scope checks supplement existing action permissions; callers validate sessions.
+
+No scope inference from names, device prefixes or legacy office_group.
+"""
+import json
+import time
+import uuid
+import auth
+
+ENTITIES = {
+    'accounts': ('accounts', 'account_offices', 'account_id', True),
+    'computers': ('computers', 'computer_offices', 'computer_id', True),
+    'cards': ('phone_cards', 'phone_card_offices', 'card_id', False),
+    'devices': ('phone_devices', 'phone_device_offices', 'device_id', False),
+}
+
+
+def current_user(db, actor):
+    auth.require(actor)
+    row = db.execute('SELECT * FROM auth_users WHERE id=? AND active=1', (actor['id'],)).fetchone()
+    if not row:
+        raise auth.AccessError('请先登录工作台', 401)
+    return {**auth.public_user(row), 'authorization_version': row['authorization_version']}
+
+
+def global_scope(actor):
+    return actor['role'] in ('owner', 'admin')
+
+
+def admitted(db):
+    if getattr(db, 'dialect', 'sqlite') == 'postgresql':
+        from psycopg.pq import TransactionStatus
+        valid = db.write_admitted and db.connection.info.transaction_status == TransactionStatus.INTRANS
+    else:
+        valid = db.in_transaction
+    if not valid:
+        raise ValueError('Scope mutations require an admitted write transaction')
+
+
+def granted_offices(db, actor):
+    actor = current_user(db, actor)
+    if global_scope(actor):
+        return {row[0] for row in db.execute('SELECT id FROM offices WHERE active=1')}
+    return {row[0] for row in db.execute('SELECT g.office_id FROM user_office_grants g JOIN offices o ON o.id=g.office_id WHERE g.user_id=? AND o.active=1', (actor['id'],))}
+
+
+def entity_offices(db, kind, ident):
+    if kind=='cards':
+        if type(ident) not in (str,int):raise auth.AccessError('无权访问此资料',403)
+        try:
+            numeric=int(ident)
+            if str(numeric)!=str(ident) or not -(2**63)<=numeric<2**63:raise ValueError()
+            ident=numeric
+        except ValueError:raise auth.AccessError('无权访问此资料',403) from None
+    table, mapping, key, single = ENTITIES[kind]
+    if not db.execute('SELECT 1 FROM ' + table + ' WHERE id=?', (ident,)).fetchone():
+        raise auth.AccessError('无权访问此资料', 403)
+    return {row[0] for row in db.execute('SELECT office_id FROM ' + mapping + ' WHERE ' + key + '=?', (ident,))}
+
+
+def visible_ids(db, actor, kind):
+    actor = current_user(db, actor)
+    table, mapping, key, single = ENTITIES[kind]
+    if global_scope(actor):
+        return {row[0] for row in db.execute('SELECT id FROM ' + table)}
+    return {row[0] for row in db.execute('SELECT DISTINCT e.id FROM ' + table + ' e JOIN ' + mapping +
+        ' s ON s.' + key + '=e.id JOIN user_office_grants g ON g.office_id=s.office_id JOIN offices o ON o.id=g.office_id WHERE g.user_id=? AND o.active=1', (actor['id'],))}
+
+
+def require_entity(db, actor, kind, ident, *, write=False):
+    actor = current_user(db, actor)
+    scopes = entity_offices(db, kind, ident)
+    if global_scope(actor):
+        return scopes
+    grants = granted_offices(db, actor)
+    if not scopes or not (scopes <= grants if write else scopes & grants):
+        raise auth.AccessError('无权访问此资料', 403)
+    return scopes
+
+
+def validated_offices(db, values):
+    if not isinstance(values, list) or len(values) > 100 or any(not isinstance(value, str) or not value or len(value) > 80 for value in values):
+        raise ValueError('办公室范围格式不正确')
+    if len(set(values)) != len(values):
+        raise ValueError('办公室范围不能重复')
+    for value in values:
+        if not db.execute('SELECT 1 FROM offices WHERE id=? AND active=1', (value,)).fetchone():
+            raise ValueError('办公室不存在或已停用')
+    return set(values)
+
+
+def assign_entity(db, actor, kind, ident, office_ids, *, newly_created=False):
+    """newly_created is an internal service flag, never copied from request JSON."""
+    admitted(db)
+    actor = current_user(db, actor)
+    current = entity_offices(db, kind, ident)
+    wanted = validated_offices(db, office_ids)
+    table, mapping, key, single = ENTITIES[kind]
+    if single and len(wanted) > 1:
+        raise ValueError('账号和电脑只能属于一个办公室')
+    if newly_created and current:
+        raise ValueError('New-entity scope can only be assigned once')
+    if not global_scope(actor):
+        grants = granted_offices(db, actor)
+        if not wanted or not wanted <= grants or (not newly_created and (not current or not current <= grants)):
+            raise auth.AccessError('无权修改资料的原办公室或目标办公室', 403)
+    db.execute('DELETE FROM ' + mapping + ' WHERE ' + key + '=?', (ident,))
+    for office_id in sorted(wanted):
+        db.execute('INSERT INTO ' + mapping + '(' + key + ',office_id) VALUES(?,?)', (ident, office_id))
+    return sorted(wanted)
+
+
+def grant_user(db, actor, user_id, office_ids):
+    admitted(db)
+    actor = current_user(db, actor)
+    auth.require(actor, 'owner')
+    wanted = validated_offices(db, office_ids)
+    if not db.execute('SELECT 1 FROM auth_users WHERE id=?', (user_id,)).fetchone():
+        raise ValueError('人员不存在')
+    old = {row[0] for row in db.execute('SELECT office_id FROM user_office_grants WHERE user_id=?', (user_id,))}
+    db.execute('DELETE FROM user_office_grants WHERE user_id=?', (user_id,))
+    for office_id in sorted(wanted):
+        db.execute('INSERT INTO user_office_grants VALUES(?,?)', (user_id, office_id))
+    version = db.execute('UPDATE auth_users SET authorization_version=authorization_version+1 WHERE id=? RETURNING authorization_version', (user_id,)).fetchone()[0]
+    db.execute('DELETE FROM auth_sessions WHERE user_id=?', (user_id,))
+    detail = json.dumps(dict(user_id=user_id, before=sorted(old), after=sorted(wanted), authorization_version=version), ensure_ascii=False)
+    db.execute('INSERT INTO auth_audit(at,actor_id,actor_name,action,target) VALUES(?,?,?,?,?)',
+               (int(time.time()), actor['id'], actor['name'], '更新办公室授权', detail))
+    return version
+
+
+def create_office(db, actor, name):
+    admitted(db)
+    actor = current_user(db, actor)
+    auth.require(actor, 'owner')
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100:
+        raise ValueError('办公室名称需为1至100字')
+    ident = 'office-' + uuid.uuid4().hex
+    db.execute('INSERT INTO offices(id,name) VALUES(?,?)', (ident, name.strip()))
+    auth.audit(db, actor, '创建办公室', ident)
+    return ident
+
+
+def scope_maps(db):
+    result = {}
+    for kind, (table, mapping, key, single) in ENTITIES.items():
+        values = {}
+        for row in db.execute('SELECT ' + key + ',office_id FROM ' + mapping):
+            values.setdefault(row[0], []).append(row[1])
+        result[kind] = {ident: sorted(offices) for ident, offices in values.items()}
+    return result
+
+
+def record_offices(maps, table, row):
+    kind = {'accounts':'accounts','phone_cards':'cards','phone_devices':'devices'}.get(table)
+    if kind:
+        return maps[kind].get(row['id'], [])
+    if table in ('daily','nurture_records'):
+        return maps['accounts'].get(row['account_id'], [])
+    if table == 'publishing_layout':
+        computer = maps['computers'].get(row['computer_id'], [])
+        account = maps['accounts'].get(row['account_id'], []) if row['account_id'] else []
+        if not computer or (row['account_id'] and not account):
+            return []
+        return sorted(set(computer) | set(account))
+    return []
+
+
+def read_context(db, actor):
+    actor = current_user(db, actor)
+    return dict(global_access=global_scope(actor), grants=granted_offices(db,actor), ids={kind:visible_ids(db,actor,kind) for kind in ENTITIES}, maps=scope_maps(db))
+
+
+def record_visible(context, table, row):
+    if context['global_access']:
+        return True
+    kind = {'accounts':'accounts','phone_cards':'cards','phone_devices':'devices','computers':'computers'}.get(table)
+    if kind:
+        return row['id'] in context['ids'][kind]
+    if table in ('daily','nurture_records'):
+        return row['account_id'] in context['ids']['accounts']
+    if table == 'publishing_layout':
+        return row['computer_id'] in context['ids']['computers'] and (row['account_id'] is None or row['account_id'] in context['ids']['accounts'])
+    return False
+
+
+def filter_board_entities(context, computers, accounts):
+    computers = [row for row in computers if record_visible(context,'computers',row)]
+    accounts = [row for row in accounts if record_visible(context,'accounts',row)]
+    for computer in computers:
+        computer['office_ids'] = context['maps']['computers'].get(computer['id'], [])
+    virtual = False
+    for account in accounts:
+        account['office_ids'] = context['maps']['accounts'].get(account['id'], [])
+        if context['global_access']:
+            continue
+        if account['parent_account_id'] not in context['ids']['accounts']:
+            account['parent_account_id'] = None
+        if account['phone_device_id'] not in context['ids']['devices']:
+            account['phone_device_id'] = None
+        if account['computer_id'] not in context['ids']['computers']:
+            account['computer_id'] = 'unassigned'
+            virtual = True
+    if virtual and not any(row['id']=='unassigned' for row in computers):
+        computers.append(dict(id='unassigned',name='未分配电脑',shadow_account='',ip='',operator='',category='',office_ids=[]))
+    return computers, accounts
+
+
+def list_offices(db, actor):
+    actor = current_user(db, actor)
+    allowed = granted_offices(db, actor)
+    return [dict(row) for row in db.execute('SELECT id,name,active FROM offices ORDER BY name,id') if global_scope(actor) or row['id'] in allowed]
+
+
+def scope_version(kind,ident,offices):
+    from operations import token
+    return token(dict(kind=kind,id=str(ident),office_ids=sorted(offices)))
+
+
+def inventory(db,actor,kind,after=''):
+    auth.require(current_user(db,actor),'owner')
+    if kind not in ENTITIES:raise ValueError('资料类型不正确')
+    table=ENTITIES[kind][0]
+    title='phone' if kind=='cards' else 'name'
+    rows=db.execute('SELECT id,'+title+' FROM '+table+' WHERE CAST(id AS TEXT)>? ORDER BY CAST(id AS TEXT) LIMIT 101',(str(after),)).fetchall()
+    result=[]
+    for row in rows[:100]:
+        offices=entity_offices(db,kind,row[0])
+        result.append(dict(id=row[0],name=row[1],office_ids=sorted(offices),scope_version=scope_version(kind,row[0],offices)))
+    return dict(entities=result,next_after=str(rows[99][0]) if len(rows)>100 else '')
+
+
+def reassign(db,actor,body):
+    admitted(db);actor=current_user(db,actor);auth.require(actor,'owner')
+    kind=body.get('kind');ident=body.get('id')
+    if kind not in ENTITIES:raise ValueError('资料类型不正确')
+    old=entity_offices(db,kind,ident)
+    if body.get('expected_scope')!=scope_version(kind,ident,old):
+        from operations import ConflictError
+        raise ConflictError('资料归属已变化，请重新读取后核对；未覆盖新的分配')
+    wanted=body.get('office_ids')
+    new=assign_entity(db,actor,kind,ident,wanted)
+    detail=json.dumps(dict(kind=kind,id=ident,before=sorted(old),after=new),ensure_ascii=False)
+    db.execute('INSERT INTO auth_audit(at,actor_id,actor_name,action,target) VALUES(?,?,?,?,?)',(int(time.time()),actor['id'],actor['name'],'分配资料办公室',detail))
+    return dict(ok=True,scope_version=scope_version(kind,ident,new),office_ids=new)
+
+
+def requested_offices(db, actor, kind, body):
+    actor=current_user(db,actor)
+    field='office_id' if kind in ('accounts','computers') else 'office_ids'
+    if field not in body and not global_scope(actor):
+        raise ValueError('新增资料必须明确选择办公室')
+    value=body.get(field)
+    if field=='office_id' and value is not None and not isinstance(value,str):raise ValueError('办公室编号格式不正确')
+    values=([value] if value else []) if field=='office_id' else ([] if value is None else value)
+    wanted=validated_offices(db,values)
+    if not global_scope(actor) and (not wanted or not wanted<=granted_offices(db,actor)):
+        raise auth.AccessError('目标办公室不在授权范围内',403)
+    return sorted(wanted)
+
+
+def save_assignment(db,actor,kind,ident,body,create=False):
+    field='office_id' if kind in ('accounts','computers') else 'office_ids'
+    if create or field in body:
+        assign_entity(db,actor,kind,ident,requested_offices(db,actor,kind,body),newly_created=create)
+
+
+def authorize_route(db, actor, path, body):
+    actor=current_user(db,actor)
+    if path=='/api/batch-edit':
+        import batch_edit
+        kind,ids,changes=batch_edit.validate(body)
+        kind={'verification':'accounts','daily':'accounts'}.get(kind,kind)
+        for ident in ids:require_entity(db,actor,kind,ident,write=True)
+        return
+    if path=='/api/bulk-status':
+        for ident in body.get('ids',[]):require_entity(db,actor,'accounts',str(ident),write=True)
+        return
+    account_paths={'/api/account','/api/account/status','/api/account/card-readiness','/api/lifecycle-status','/api/account/phone-device','/api/account/nurture','/api/daily'}
+    if path in account_paths or path.startswith('/api/workspace/nurture/'):
+        require_entity(db,actor,'accounts',str(body.get('id','')),write=True)
+    if path=='/api/account/create':requested_offices(db,actor,'accounts',body)
+    if path in ('/api/account','/api/account/create','/api/account/phone-device'):
+        for field,kind in [('computer_id','computers'),('parent_account_id','accounts'),('phone_device_id','devices')]:
+            if body.get(field) and not (field=='computer_id' and body[field]=='unassigned'):require_entity(db,actor,kind,str(body[field]),write=kind=='devices')
+        if path!='/api/account/create' and body.get('id'):
+            old=db.execute('SELECT phone_device_id,computer_id,parent_account_id FROM accounts WHERE id=?',(str(body['id']),)).fetchone()
+            if old:
+                for index,field,kind in [(0,'phone_device_id','devices'),(1,'computer_id','computers'),(2,'parent_account_id','accounts')]:
+                    if old[index] and field in body and old[index]!=(body[field] or None) and not (field=='computer_id' and old[index]=='unassigned'):
+                        require_entity(db,actor,kind,old[index],write=kind=='devices')
+    if path=='/api/phone-card':
+        if body.get('id') is not None:require_entity(db,actor,'cards',body['id'],write=True)
+        else:requested_offices(db,actor,'cards',body)
+    if path=='/api/phone-device':
+        from phone_devices import device_identity
+        require_entity(db,actor,'devices',device_identity(body.get('id','')),write=True)
+    if path=='/api/phone-device/create':requested_offices(db,actor,'devices',body)
+    if path=='/api/phone-cards/import':requested_offices(db,actor,'cards',body)
+    if path in ('/api/publishing/link','/api/publishing/assignment'):
+        for field in ('computer_id','target_computer'):
+            if body.get(field):require_entity(db,actor,'computers',str(body[field]),write=True)
+        cell=db.execute('SELECT account_id FROM publishing_layout WHERE batch=? AND computer_id=? AND slot=?',
+            (str(body.get('batch','')),str(body.get('computer_id','')),body.get('slot'))).fetchone()
+        for ident in (cell[0] if cell else None,body.get('account_id')):
+            if ident:require_entity(db,actor,'accounts',str(ident),write=True)
+
+
+def history_scopes(maps, table, old, new):
+    scopes=set()
+    for row in (old,new):
+        if row is None:continue
+        if not row.get('office_ids'):return None
+        scopes.update(row['office_ids'])
+        if table=='accounts':
+            for field,kind in [('computer_id','computers'),('parent_account_id','accounts'),('phone_device_id','devices')]:
+                if row.get(field) and not (field=='computer_id' and row[field]=='unassigned'):
+                    related=maps[kind].get(row[field],[])
+                    if not related:return None
+                    scopes.update(related)
+    return sorted(scopes) if scopes else None

@@ -1,0 +1,13 @@
+const fs=require('node:fs'),assert=require('node:assert/strict'),vm=require('node:vm');
+const source=fs.readFileSync('static/app.js','utf8'),html=fs.readFileSync('static/index.html','utf8');
+const elements={},$=id=>elements[id]??={};
+const start=source.indexOf("$('autoCollect').checked="),end=source.indexOf(";$('scope').textContent",start);
+const render=source.slice(start,end)+';';
+const context={$ ,data:{accounts:[{},{}],collection:{auto_enabled:false,paused:false,worker_online:true,worker_status:'待命',linked:2,waiting:1,done:1,failed:0}}};
+vm.createContext(context);vm.runInContext(render,context);
+assert.match($('collectionInfo').textContent,/采集器在线/);assert.match($('collectionInfo').textContent,/1 个成功/);assert.equal($('resumeCollect').hidden,true);
+context.data.collection.worker_status='等待手动登录或验证';vm.runInContext(render,context);assert.equal($('resumeCollect').hidden,false);
+context.data.collection.paused=true;context.data.collection.pause_reason='需要验证';vm.runInContext(render,context);assert.match($('collectionInfo').textContent,/采集已暂停：需要验证/);
+assert.match(source,/api\('\/api\/collection\/settings',\{open_browser:true\}\)/);
+assert.match(source,/card-count[^>]*title=/);assert.match(html,/失败保留上次成功数量和时间/);
+console.log('F2在线/登录继续/暂停/共享计数/网页版打开浏览器/看板采集状态测试通过');

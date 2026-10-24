@@ -1,0 +1,38 @@
+{
+  "kind": "local-postgresql-capability-probe-not-platform-acceptance",
+  "started_utc": "2026-10-21T14:01:47.425860+00:00",
+  "host": "127.0.0.1",
+  "port": 11062,
+  "passed": true,
+  "version": "postgres (PostgreSQL) 16.15",
+  "services": {
+    "passed": true,
+    "checks": [
+      "quoted-qmark-percent-and-injection-as-value",
+      "invalid-binding-rejected",
+      "owner-setup-and-session",
+      "employee-create-login-limit-upsert",
+      "disable-revokes-session",
+      "card-returning-id-update",
+      "card-import-idempotent",
+      "service-rollback",
+      "numeric-order-equivalence",
+      "account-create-audit-and-history",
+      "device-assignment",
+      "publishing-link-json-history",
+      "nurture-png-bytea-roundtrip"
+    ]
+  },
+  "checks": [
+    "UTF8",
+    "NULL",
+    "leading-zero",
+    "bytea",
+    "rollback",
+    "conditional-update",
+    "schema-dump-restore",
+    "restored-identity-sequence"
+  ],
+  "ended_utc": "2026-10-21T14:02:13.992397+00:00",
+  "server_stopped": true
+}

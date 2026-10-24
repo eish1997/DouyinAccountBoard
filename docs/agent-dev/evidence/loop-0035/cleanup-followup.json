@@ -1,0 +1,6 @@
+{
+  "postmaster_pid_absent": true,
+  "synthetic_root": "loop-0035-atomic-patch-b",
+  "observed_utc": "2026-10-21T15:56:02.0645589Z",
+  "note": "Original cleanup timeout report retained; postgres.log subsequently records database system is shut down."
+}

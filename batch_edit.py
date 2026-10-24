@@ -1,0 +1,64 @@
+"""Atomic edits of explicitly selected fields; reuse single-record validators."""
+from datetime import date
+import auth,phone_cards,phone_devices,nurture
+
+FIELDS={
+ 'accounts':{'status','card_stability','password_state'},
+ 'cards':{'owner','ownership','keeper','code_contact'},
+ 'devices':{'state','owner','location'},
+ 'verification':{'verification_state','verification_owner','verification_note'},
+ 'daily':{'published','date'},
+}
+BATCH_PERMISSIONS=frozenset({'card_manage','card_tasks','account_status','account_progress','device_manage','nurture_manage','publish'})
+TABLE={'accounts':'accounts','cards':'phone_cards','devices':'phone_devices','verification':'accounts','daily':'accounts'}
+def validate(body):
+ kind=body.get('kind');ids=body.get('ids');patch=body.get('patch')
+ if type(kind) is not str or kind not in FIELDS:raise ValueError('批量修改类型不正确')
+ if not isinstance(ids,list) or not 0<len(ids)<=2000 or any(type(i) is not str or not i for i in ids) or len(set(ids))!=len(ids):raise ValueError('请选择1至2000条不重复的记录')
+ if not isinstance(patch,dict) or not patch or set(patch)-FIELDS[kind]:raise ValueError('只能批量修改页面列出的字段')
+ if any(type(v) is not str for k,v in patch.items() if k!='published'):raise ValueError('字段应为文本')
+ if kind=='daily' and (set(patch)!={'published','date'} or type(patch['published']) is not bool):raise ValueError('请选择发布日期及已发/未发')
+ return kind,ids,patch
+def authorize(actor,body):
+ kind,ids,patch=validate(body)
+ if kind=='cards':
+  for field in patch:auth.require(actor,'card_tasks' if field in auth.CARD_TASK_FIELDS else 'card_manage')
+ elif kind=='accounts':
+  for field in patch:auth.require(actor,'account_status' if field=='status' else 'account_progress')
+ else:auth.require(actor,{'devices':'device_manage','verification':'nurture_manage','daily':'publish'}[kind])
+def keys(body):
+ kind,ids,patch=validate(body)
+ prefix={'cards':'card','devices':'device'}.get(kind,'account')
+ result=[prefix+':'+i for i in ids]
+ if kind=='verification':result+=['nurture:'+i for i in ids]
+ if kind=='daily':result+=['daily:'+i+':'+patch['date'] for i in ids]
+ return result
+def apply(db,actor,body,today):
+ authorize(actor,body);kind,ids,patch=validate(body)
+ if getattr(db,'scope_enabled',False):
+  import office_scope
+  office_scope.authorize_route(db,actor,'/api/batch-edit',body)
+ # Validate all identities before the first write. Caller owns the transaction.
+ records=[]
+ for ident in ids:
+  if kind=='cards' and (not ident.isascii() or not ident.isdigit() or str(int(ident))!=ident):raise ValueError('手机卡记录编号不正确')
+  old=db.execute('SELECT * FROM '+TABLE[kind]+' WHERE id=?',(ident,)).fetchone()
+  if not old:raise ValueError('记录 '+ident+' 已不存在，请刷新重新选择')
+  records.append(dict(old))
+ for old in records:
+  ident=str(old['id'])
+  if kind=='cards':phone_cards.save(db,{**old,**patch},actor=actor)
+  elif kind=='devices':
+   values={**old,'state':'auto' if old['state_source']=='auto' else old['state'],**patch}
+   phone_devices.save(db,values,actor=actor)
+  elif kind=='verification':nurture.post(db,actor,'/api/workspace/nurture/verification',dict(id=ident,**patch),today)
+  elif kind=='accounts':
+   if 'status' in patch:
+    from app import STATES
+    if patch['status'] not in STATES:raise ValueError('账号状态不正确')
+    db.execute("UPDATE accounts SET nurture_started=CASE WHEN ?='养号7天' AND status<>'养号7天' THEN '' ELSE nurture_started END,status=? WHERE id=?",(patch['status'],patch['status'],ident))
+   if {'card_stability','password_state'}&patch.keys():phone_cards.update_readiness(db,ident,patch)
+  else:
+   date.fromisoformat(patch['date'])
+   db.execute('INSERT INTO daily VALUES(?,?,?) ON CONFLICT(account_id,day) DO UPDATE SET published=excluded.published',(ident,patch['date'],int(patch['published'])))
+ return dict(ok=True,count=len(ids))

@@ -1,0 +1,130 @@
+"""Persistent work-count queue. Collection errors never change manual account status."""
+import re
+import secrets
+import time
+from release_policy import require_collection, COLLECTION_MESSAGE
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
+
+def timestamp():
+    return datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds')
+
+def normalize_homepage(value):
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    parsed = urlparse(value)
+    if parsed.scheme != 'https' or parsed.netloc != 'www.douyin.com' or not re.fullmatch(r'/user/[A-Za-z0-9_-]{5,200}/?',parsed.path):
+        raise ValueError('请从抖音网页版复制完整个人主页链接：https://www.douyin.com/user/...')
+    return 'https://www.douyin.com' + parsed.path.rstrip('/')
+
+def migrate(db):
+    columns={r[1] for r in db.execute('PRAGMA table_info(accounts)')}
+    for name in ['collection_state','collection_error','last_attempted']:
+        if name not in columns:
+            db.execute(f"ALTER TABLE accounts ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+    db.executescript('''
+    CREATE TABLE IF NOT EXISTS collection_jobs(account_id TEXT PRIMARY KEY REFERENCES accounts(id), homepage TEXT NOT NULL, douyin_id TEXT NOT NULL DEFAULT '', token TEXT NOT NULL, state TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS collection_settings(id INTEGER PRIMARY KEY CHECK(id=1),auto_enabled INTEGER NOT NULL DEFAULT 1, paused INTEGER NOT NULL DEFAULT 0, pause_reason TEXT NOT NULL DEFAULT '');
+    INSERT OR IGNORE INTO collection_settings(id) VALUES(1);
+    ''')
+    if 'douyin_id' not in {r[1] for r in db.execute('PRAGMA table_info(collection_jobs)')}:
+        db.execute("ALTER TABLE collection_jobs ADD COLUMN douyin_id TEXT NOT NULL DEFAULT ''")
+    db.execute("CREATE TABLE IF NOT EXISTS collection_worker(id INTEGER PRIMARY KEY CHECK(id=1),seen REAL NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT '',command TEXT NOT NULL DEFAULT '')")
+    db.execute('INSERT OR IGNORE INTO collection_worker(id) VALUES(1)')
+
+def enqueue(db, ids):
+    require_collection()
+    queued=0;missing=0
+    for account_id in dict.fromkeys(str(i) for i in ids):
+        a=db.execute('SELECT * FROM accounts WHERE id=?',(account_id,)).fetchone()
+        if not a:
+            raise ValueError('账号不存在：'+account_id)
+        if not a['homepage'] and not a['douyin_id']:
+            missing+=1;continue
+        homepage=normalize_homepage(a['homepage'])
+        if db.execute("SELECT 1 FROM collection_jobs WHERE account_id=? AND state IN ('queued','running')",(account_id,)).fetchone():
+            continue
+        db.execute('INSERT INTO collection_jobs(account_id,homepage,douyin_id,token,state) VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET homepage=excluded.homepage,douyin_id=excluded.douyin_id,token=excluded.token,state=excluded.state,started_at=?',(account_id,homepage,a['douyin_id'],secrets.token_hex(16),'queued',''))
+        db.execute("UPDATE accounts SET collection_state='等待采集',collection_error='' WHERE id=?",(account_id,));queued+=1
+    return dict(queued=queued,missing=missing)
+
+def next_job(db,day):
+    require_collection()
+    settings=db.execute('SELECT * FROM collection_settings WHERE id=1').fetchone()
+    if settings['paused']:
+        return None
+    # A dead process must not strand a lease forever. Late results use the old token.
+    cutoff=(datetime.now(timezone(timedelta(hours=8)))-timedelta(minutes=10)).isoformat(timespec='seconds')
+    for row in db.execute("SELECT account_id FROM collection_jobs WHERE state='running' AND started_at<?",(cutoff,)).fetchall():
+        db.execute("UPDATE collection_jobs SET state='queued',token=? WHERE account_id=?",(secrets.token_hex(16),row[0]))
+    if db.execute("SELECT 1 FROM collection_jobs WHERE state='running'").fetchone():
+        return None
+    if settings['auto_enabled']:
+        due=[r[0] for r in db.execute("SELECT id FROM accounts WHERE (homepage<>'' OR douyin_id<>'') AND substr(last_attempted,1,10)<>? AND id NOT IN (SELECT account_id FROM collection_jobs WHERE state IN ('queued','running')) ORDER BY last_attempted LIMIT 20",(day,))]
+        enqueue(db,due)
+    job=db.execute("SELECT j.*,a.name FROM collection_jobs j JOIN accounts a ON a.id=j.account_id WHERE j.state='queued' ORDER BY CAST(a.computer_id AS INTEGER),a.slot LIMIT 1").fetchone()
+    if not job:
+        return None
+    now=timestamp()
+    db.execute("UPDATE collection_jobs SET state='running',started_at=? WHERE account_id=? AND token=?",(now,job['account_id'],job['token']))
+    db.execute("UPDATE accounts SET collection_state='采集中',last_attempted=? WHERE id=?",(now,job['account_id']))
+    return dict(job)
+
+def complete(db,body):
+    require_collection()
+    job=db.execute("SELECT j.*,a.homepage AS current_homepage,a.douyin_id AS current_douyin_id FROM collection_jobs j JOIN accounts a ON a.id=j.account_id WHERE j.account_id=? AND j.token=? AND j.state='running'",(str(body['account_id']),body['token'])).fetchone()
+    if not job:
+        return dict(ignored=True)
+    if job['homepage']!=job['current_homepage'] or job['douyin_id']!=job['current_douyin_id']:
+        db.execute("UPDATE collection_jobs SET state='done' WHERE account_id=? AND token=?",(job['account_id'],job['token']))
+        db.execute("UPDATE accounts SET collection_state='采集失败',collection_error='采集期间账号标识发生变化，请重新采集' WHERE id=?",(job['account_id'],))
+        return dict(ignored=True)
+    count=body.get('count');error=str(body.get('error',''))[:400];blocked=bool(body.get('blocked'))
+    if error:
+        state='需要验证' if blocked else '采集失败'
+        db.execute('UPDATE accounts SET collection_state=?,collection_error=? WHERE id=?',(state,error,job['account_id']))
+        if blocked:
+            db.execute('UPDATE collection_settings SET paused=1,pause_reason=? WHERE id=1',(error,))
+    else:
+        if type(count) is not int or not 0<=count<=10000000:
+            raise ValueError('作品数量必须是非负整数')
+        source=normalize_homepage(body.get('source_url'))
+        if not source:
+            raise ValueError('采集来源为空')
+        if job['douyin_id'] and body.get('matched_douyin_id')!=job['douyin_id']:
+            raise ValueError('搜索结果与真实抖音号不一致')
+        if job['homepage'] and not job['douyin_id']:
+            if source!=job['homepage']:
+                raise ValueError('采集主页与账号绑定主页不一致')
+        elif body.get('matched_douyin_id')!=job['douyin_id']:
+            raise ValueError('搜索结果与真实抖音号不一致')
+        db.execute("UPDATE accounts SET homepage=?,work_count=?,last_collected=?,collection_state='采集成功',collection_error='' WHERE id=?",(source,count,timestamp(),job['account_id']))
+    db.execute("UPDATE collection_jobs SET state='done' WHERE account_id=? AND token=?",(job['account_id'],job['token']))
+    return dict(ok=True)
+
+def heartbeat(db, status):
+    require_collection()
+    allowed={'待命','正在采集','等待手动登录或验证','采集器异常'}
+    if status not in allowed:raise ValueError('采集器状态不正确')
+    row=db.execute('SELECT command FROM collection_worker WHERE id=1').fetchone()
+    db.execute("UPDATE collection_worker SET seen=?,status=?,command='' WHERE id=1",(time.time(),status))
+    return {'command':row[0]}
+
+def overview(db,accounts=None):
+    settings=dict(db.execute('SELECT * FROM collection_settings WHERE id=1').fetchone())
+    settings['waiting']=db.execute("SELECT count(*) FROM collection_jobs WHERE state IN ('queued','running')").fetchone()[0]
+    settings['linked']=db.execute("SELECT count(*) FROM accounts WHERE homepage<>'' OR douyin_id<>''").fetchone()[0]
+    worker=db.execute('SELECT seen,status FROM collection_worker WHERE id=1').fetchone()
+    settings['worker_online']=bool(worker and time.time()-worker['seen']<30)
+    settings['worker_status']=worker['status'] if settings['worker_online'] else '采集器离线：请在服务器电脑登录 Windows'
+    settings['done']=db.execute("SELECT count(*) FROM accounts WHERE collection_state='采集成功'").fetchone()[0]
+    settings['failed']=db.execute("SELECT count(*) FROM accounts WHERE collection_state IN ('采集失败','需要验证')").fetchone()[0]
+    settings.update(enabled=False, worker_online=False, worker_status=COLLECTION_MESSAGE)
+    if accounts is not None:
+        ids=[row['id'] for row in accounts]
+        settings['waiting']=db.execute("SELECT count(*) FROM collection_jobs WHERE state IN ('queued','running') AND account_id IN ("+','.join('?' for _ in ids)+')',ids).fetchone()[0] if ids else 0
+        settings['linked']=sum(bool(row['homepage'] or row['douyin_id']) for row in accounts)
+        settings['done']=sum(row['collection_state']=='采集成功' for row in accounts)
+        settings['failed']=sum(row['collection_state'] in ('采集失败','需要验证') for row in accounts)
+    return settings

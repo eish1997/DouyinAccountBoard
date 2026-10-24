@@ -1,0 +1,33 @@
+"""PostgreSQL write admission primitive; application integration is still pending.
+
+Every writer must enter this transaction before reading authorization or entity
+versions. Administrative maintenance/revocation acquires the same control row.
+Callers must check current session, permissions and entity scope inside the yield.
+"""
+from contextlib import contextmanager
+from psycopg.pq import TransactionStatus
+
+
+class AdmissionRejected(ValueError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+@contextmanager
+def write_transaction(connection, *, writer_epoch, restore_generation):
+    if connection.info.transaction_status != TransactionStatus.IDLE:
+        raise AdmissionRejected('TRANSACTION_ALREADY_ACTIVE')
+    with connection.transaction():
+        connection.execute("SET LOCAL lock_timeout = '5s'")
+        connection.execute("SET LOCAL statement_timeout = '15s'")
+        control = connection.execute('SELECT mode,writer_epoch,restore_generation FROM board_app.runtime_control WHERE id=1 FOR UPDATE').fetchone()
+        if not control:
+            raise AdmissionRejected('CONTROL_STATE_MISSING')
+        if control[0] != 'open':
+            raise AdmissionRejected('MAINTENANCE')
+        if control[1] != writer_epoch:
+            raise AdmissionRejected('WRITER_VERSION_RETIRED')
+        if control[2] != restore_generation:
+            raise AdmissionRejected('RESTORE_GENERATION_EXPIRED')
+        yield connection

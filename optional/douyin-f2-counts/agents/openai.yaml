@@ -1,0 +1,4 @@
+interface:
+  display_name: "抖音作品数量查询（F2）"
+  short_description: "批量读取抖音公开作品数量，导出账号、昵称、查询时间及可点击的主页链接"
+  default_prompt: "使用 $douyin-f2-counts 查询这批账号的作品数量，并附上可点击的主页链接。"

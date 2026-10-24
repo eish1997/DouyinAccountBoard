@@ -1,0 +1,57 @@
+{
+  "kind": "local-postgresql-capability-probe-not-platform-acceptance",
+  "started_utc": "2026-10-21T13:52:31.281418+00:00",
+  "host": "127.0.0.1",
+  "port": 9338,
+  "passed": true,
+  "version": "postgres (PostgreSQL) 16.15",
+  "migration": {
+    "passed": true,
+    "table_counts": {
+      "computers": 1,
+      "phone_devices": 1,
+      "accounts": 1,
+      "daily": 1,
+      "imports": 1,
+      "auth_users": 1,
+      "auth_sessions": 1,
+      "auth_setup": 1,
+      "auth_limits": 1,
+      "auth_audit": 1,
+      "auth_migrations": 1,
+      "phone_cards": 1,
+      "collection_jobs": 1,
+      "collection_settings": 1,
+      "collection_worker": 1,
+      "publishing_layout": 1,
+      "publishing_layout_state": 1,
+      "publishing_layout_links": 1,
+      "operations_history": 1,
+      "operations_previews": 1,
+      "nurture_records": 1,
+      "nurture_images": 1
+    },
+    "checks": [
+      "22-table-full-field-equality",
+      "late-failure-full-rollback",
+      "idempotent-schema",
+      "nonempty-target-rejected",
+      "maintenance-default",
+      "identity-after-explicit-id",
+      "foreign-key-enforced",
+      "migration-checksum-drift-rejected"
+    ]
+  },
+  "checks": [
+    "UTF8",
+    "NULL",
+    "leading-zero",
+    "bytea",
+    "rollback",
+    "conditional-update",
+    "schema-dump-restore",
+    "restored-identity-sequence"
+  ],
+  "ended_utc": "2026-10-21T13:52:55.081925+00:00",
+  "server_stopped": true
+}

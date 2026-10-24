@@ -1,0 +1,2 @@
+f2 @ https://github.com/Johnserf-Seed/f2/archive/f6be8c0ffba9a127075bbeafe4838716650b6325.zip
+playwright==1.61.0

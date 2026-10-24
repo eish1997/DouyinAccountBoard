@@ -1,0 +1,30 @@
+function workspaceOffice(account){if(Array.isArray(account.office_ids))return account.office_ids[0]||'pending';const value=String(account.phone_device_id??'');if(/^office3:\d+$/.test(value)||(!value&&account.office_group==='three'))return 'three';if(!/^\d+$/.test(value)||!Number.isSafeInteger(Number(value))||Number(value)<1)return 'pending';return Number(value)>=301&&Number(value)<=700?'two':'one';}
+function workspaceDays(start,today){if(!/^\d{4}-\d{2}-\d{2}$/.test(start||''))return null;return Math.floor((Date.parse(today+'T00:00:00Z')-Date.parse(start+'T00:00:00Z'))/86400000);}
+function workspaceTodos(board){
+ const nurturing=new Map((board.nurture?.records||[]).filter(record=>!record.completed_on).map(record=>[record.account_id,record]));
+ const tasks=[],positions=board.publishing_layout?.enabled?board.publishing_layout.cells:[],assigned=new Set(positions.filter(cell=>cell.account_id).map(cell=>cell.account_id));
+ const accountTask=(account,kind,title,reason)=>tasks.push({kind,title,reason,account_id:account.id,office:workspaceOffice(account),name:'#'+account.id+' '+account.name});
+ for(const account of board.accounts){
+  const scheduled=board.publishing_layout?.enabled?assigned.has(account.id):account.computer_id!=='unassigned';
+  if((board.nurture?.records||[]).some(record=>record.account_id===account.id&&record.completed_on)&&!scheduled&&account.status==='正常')accountTask(account,'nurture_schedule','养号结束待安排发布','已转正常，但当前工作进度布局没有发布位置，请补安排后重新导入或核对关联');
+  if(scheduled&&!nurturing.has(account.id)&&!account.published&&!['封禁','停用','发不了','短期封禁'].includes(account.status))accountTask(account,'publish','待记录发布',board.date+' 尚未记录已发布');
+  if(account.lifecycle==='满30天未注册')accountTask(account,'aux','满30天待开小号','按已登记注册日期计算，实际创建需人工确认');
+  const nurture=nurturing.get(account.id);
+  if(nurture&&'workflow' in nurture){
+   const kinds={'待检查':['nurture_check','检查账号是否可使用'],'状态待核对':['nurture_check','核对账号异常状态'],'核对处理中':['nurture_verification','跟进账号核对'],'待开始养号':['nurture_start','可使用，待开始养号'],'养号暂停':['nurture_paused','养号暂停，待继续'],'到期待转发布':['nurture','实际养号7天已到期']};
+   const item=kinds[nurture.stage];if(item)accountTask(account,item[0],item[1],(nurture.verification_owner?'负责人 '+nurture.verification_owner+'；':'')+(nurture.verification_note||'请在养号面板处理，核对与暂停不计时'));
+  }else if(account.status==='养号7天'||nurturing.has(account.id)){
+   const days=workspaceDays(nurturing.get(account.id)?.started_on||account.nurture_started,board.today);
+   if(days===null)accountTask(account,'nurture_missing','补充养号开始日期','没有开始日期，系统不猜测到期日');
+   else if(days>=7)accountTask(account,'nurture','养号7天已到期','开始日期 '+account.nurture_started+'，请人工确认下一步状态');
+  }
+  if(scheduled&&['封禁','发不了','短期封禁','停用'].includes(account.status))accountTask(account,'abnormal','复核异常账号发布安排',account.status+'；不自动移出账号或判定手机闲置');
+ }
+ for(const cell of positions)if(cell.label&&!cell.account_id)tasks.push({kind:'match',title:'待关联发布格子',reason:cell.reason||'需确认对应账号',name:cell.source_cell+' · '+cell.label,office:board.user?.scope_mode?(board.computers.find(c=>c.id===cell.computer_id)?.office_ids?.[0]||'pending'):cell.office,computer_id:cell.computer_id,slot:cell.slot});
+ for(const card of board.phone_cards?.cards||[]){
+  const related=board.accounts.filter(account=>account.registration_phone===card.phone),offices=card.office_ids||[...new Set(related.map(workspaceOffice))];
+  for(const [active,kind,title] of [[card.code_state==='待接码','code','待接码'],[card.return_state==='待归还','return','待归还手机卡'],[card.status==='待注销','cancel','待处理卡注销记录']])if(active)tasks.push({kind,title,name:card.phone+' · '+(card.owner||'卡主待确认'),reason:kind==='return'&&card.return_due?'预计归还 '+card.return_due:card.code_note||'请核对实际情况后处理',card_id:card.id,offices,office:offices[0]||'pending'});
+ }
+ for(const phone of board.phone_devices?.devices||[])if(phone.state==='待清理')tasks.push({kind:'clean',title:'手机待清理确认',name:phone.name,reason:phone.attention||'核对实物并清理后，再人工标记可用闲置',device_id:phone.id,offices:phone.office_ids,office:Array.isArray(phone.office_ids)?workspaceOffice(phone):workspaceOffice({phone_device_id:phone.id})});
+ return tasks;
+}

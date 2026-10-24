@@ -1,0 +1,43 @@
+const byId=id=>document.getElementById(id);
+const safe=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let metadata=null,people=[];
+async function request(path,body){
+ const response=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json','X-CSRF-Token':metadata?.user?.csrf||''}:{},body:body?JSON.stringify(body):undefined});
+ const result=await response.json();if(response.status===401){location.replace('/login.html');throw Error('请先登录');}if(!response.ok)throw Error(result.error||'操作失败');return result;
+}
+function permissionMarkup(chosen,editable){
+ return metadata.permission_groups.map(([title,keys])=>`<fieldset class="grant-group"><legend>${safe(title)}</legend><div class="grant-grid">${keys.map(key=>`<label class="grant-option">${editable?`<input type="checkbox" value="${safe(key)}" ${chosen.includes(key)?'checked':''}>`:''}<span><strong>${safe(metadata.permissions[key])}</strong><small>${safe(metadata.permission_details[key])}</small></span></label>`).join('')}</div></fieldset>`).join('');
+}
+function selectedGrants(){return [...document.querySelectorAll('#personGrants input:checked')].map(input=>input.value);}
+function updateGrantCount(){byId('grantCount').textContent=`${selectedGrants().length} / ${Object.keys(metadata.permissions).length} 项`;}
+function setGrants(grants){byId('personGrants').innerHTML=permissionMarkup(grants,true);updateGrantCount();}
+function renderPeople(){
+ const query=byId('userSearch').value.trim().toLowerCase(),filter=byId('userFilter').value;
+ const shown=people.filter(person=>(!query||[person.username,person.name].some(value=>value.toLowerCase().includes(query)))&&(!filter||((filter==='active')===person.active)));
+ byId('peopleBody').innerHTML=shown.map(person=>`<tr><td><strong>${safe(person.name)}</strong><small>登录名：${safe(person.username)}</small></td><td>${safe(metadata.roles[person.role])}<small>${person.active?'启用中':'已停用'}</small></td><td>${person.role==='owner'?'<strong>全部业务操作 + 人员授权</strong><small>你的唯一总管理员账号</small>':person.permissions.length?person.permissions.map(key=>`<span class="grant-tag">${safe(metadata.permissions[key])}</span>`).join(''):'仅查看资料，无修改权限'}</td><td>${person.role==='owner'?'<span class="permission-note">本人改密请返回工作台</span>':`<button class="button" data-person="${person.id}">编辑权限 / 重设密码</button>`}</td></tr>`).join('')||'<tr><td colspan="4">没有符合条件的人员</td></tr>';
+ byId('peopleCount').textContent=`显示 ${shown.length} / ${people.length} 人`;
+ byId('userStats').innerHTML=[['登录人员',people.length],['已启用',people.filter(p=>p.active).length],['已停用',people.filter(p=>!p.active).length],['可分配操作',Object.keys(metadata.permissions).length]].map(([label,count])=>`<div class="stat"><div class="stat-label">${label}</div><strong>${count}</strong></div>`).join('');
+}
+async function refreshPeople(){
+ metadata=await request('/api/auth/me');if(!metadata.user){location.replace('/login.html');return;}if(metadata.user.role!=='owner'){byId('ownerContent').hidden=true;throw Error('只有总管理员可以进入人员授权页面。请返回工作台使用你的日常账号。');}
+ people=(await request('/api/auth/users')).users;byId('ownerContent').hidden=false;byId('permissionGuide').innerHTML=permissionMarkup([],false);byId('pageError').textContent='';renderPeople();
+}
+function editPerson(id){
+ const person=people.find(p=>p.id===id);if(person?.role==='owner')return;
+ byId('personForm').reset();byId('personId').value=person?.id||'';byId('personUsername').value=person?.username||'';byId('personUsername').readOnly=!!person;byId('personName').value=person?.name||'';byId('personRole').value=person?.role||'employee';byId('personActive').value=person?.active===false?'no':'yes';byId('personPassword').required=!person;byId('personConfirm').required=!person;byId('personPasswordLabel').textContent=person?'重设密码（可留空）':'初始密码';byId('passwordHint').textContent=person?'不修改密码时两项留空；需要重设时填写两次新密码，至少10位。':'请设置至少10位的初始密码，员工可登录后自行修改。';byId('personTitle').textContent=person?'编辑子账号与权限':'添加子账号';byId('personError').textContent='';setGrants(person?.permissions||metadata.defaults.employee);byId('personDialog').showModal();
+}
+byId('userSearch').oninput=renderPeople;byId('userFilter').onchange=renderPeople;
+byId('addPerson').onclick=()=>editPerson(null);
+byId('refreshPeople').onclick=()=>refreshPeople().catch(error=>byId('pageError').textContent=error.message);
+byId('peopleBody').onclick=event=>{const button=event.target.closest('[data-person]');if(button)editPerson(Number(button.dataset.person));};
+byId('closePerson').onclick=()=>byId('personDialog').close();
+byId('personDialog').addEventListener('close',()=>{byId('personPassword').value='';byId('personConfirm').value='';});
+byId('personRole').onchange=()=>setGrants(metadata.defaults[byId('personRole').value]);
+byId('grantAll').onclick=()=>setGrants(Object.keys(metadata.permissions));byId('grantNone').onclick=()=>setGrants([]);byId('personGrants').onchange=updateGrantCount;
+byId('personForm').onsubmit=async event=>{
+ event.preventDefault();byId('personError').textContent='';if(byId('personPassword').value!==byId('personConfirm').value){byId('personError').textContent='两次密码不一致';return;}
+ const button=event.submitter;button.disabled=true;
+ try{await request('/api/auth/users',{id:byId('personId').value?Number(byId('personId').value):null,username:byId('personUsername').value,name:byId('personName').value,role:byId('personRole').value,active:byId('personActive').value==='yes',password:byId('personPassword').value,permissions:selectedGrants()});byId('personDialog').close();await refreshPeople();byId('auditSection').hidden=true;}catch(error){byId('personError').textContent=error.message;}finally{button.disabled=false;}
+};
+byId('auditToggle').onclick=async()=>{try{const entries=(await request('/api/auth/audit')).entries;byId('peopleAudit').innerHTML=entries.map(entry=>`<p>${safe(new Date(entry.at*1000).toLocaleString('zh-CN'))} · ${safe(entry.actor_name)} · ${safe(entry.action)} ${safe(entry.target)}</p>`).join('')||'<p>暂无记录</p>';byId('auditSection').hidden=!byId('auditSection').hidden;}catch(error){byId('pageError').textContent=error.message;}};
+refreshPeople().catch(error=>byId('pageError').textContent=error.message);

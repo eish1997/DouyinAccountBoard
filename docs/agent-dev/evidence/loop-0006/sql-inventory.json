@@ -1,0 +1,183 @@
+{
+  "kind": "static_inventory_not_adapter_validation",
+  "files": {
+    "app.py": {
+      "sqlite_api": [
+        3,
+        39,
+        41,
+        62,
+        366
+      ],
+      "pragma": [
+        42
+      ],
+      "sqlite_write_lock": [
+        154,
+        187,
+        244,
+        255
+      ],
+      "upsert": [
+        350
+      ],
+      "integer_cast": [
+        168,
+        169
+      ],
+      "implicit_migrations": [
+        66
+      ],
+      "sqlite_error_types": [
+        41,
+        62,
+        366
+      ]
+    },
+    "auth.py": {
+      "upsert": [
+        184
+      ],
+      "rowid_or_lastrowid": [
+        166,
+        210
+      ],
+      "implicit_migrations": [
+        54
+      ]
+    },
+    "account_service.py": {
+      "insert_or_ignore": [
+        12
+      ],
+      "max_id_generation": [
+        13
+      ],
+      "integer_cast": [
+        13
+      ]
+    },
+    "account_lifecycle.py": {
+      "pragma": [
+        9
+      ]
+    },
+    "backup.py": {
+      "sqlite_api": [
+        2,
+        24,
+        25
+      ],
+      "pragma": [
+        27
+      ],
+      "sqlite_backup": [
+        26
+      ]
+    },
+    "backup_management.py": {
+      "sqlite_api": [
+        3,
+        38,
+        52
+      ],
+      "pragma": [
+        39,
+        53,
+        55,
+        59,
+        60,
+        65
+      ],
+      "rowid_or_lastrowid": [
+        33
+      ]
+    },
+    "batch_edit.py": {
+      "upsert": [
+        59
+      ]
+    },
+    "collection.py": {
+      "pragma": [
+        22,
+        31
+      ],
+      "insert_or_ignore": [
+        29,
+        34
+      ],
+      "upsert": [
+        48
+      ],
+      "integer_cast": [
+        66
+      ],
+      "implicit_migrations": [
+        26
+      ]
+    },
+    "data_exchange.py": {
+      "sqlite_api": [
+        7,
+        152
+      ],
+      "sqlite_error_types": [
+        152
+      ]
+    },
+    "nurture.py": {
+      "pragma": [
+        21
+      ],
+      "implicit_migrations": [
+        13
+      ]
+    },
+    "operations.py": {
+      "pragma": [
+        28
+      ]
+    },
+    "phone_cards.py": {
+      "pragma": [
+        22,
+        26
+      ],
+      "insert_or_ignore": [
+        111
+      ],
+      "rowid_or_lastrowid": [
+        89
+      ]
+    },
+    "phone_devices.py": {
+      "pragma": [
+        28
+      ],
+      "integer_cast": [
+        39
+      ]
+    },
+    "publishing_layout.py": {
+      "integer_cast": [
+        27
+      ],
+      "implicit_migrations": [
+        9
+      ]
+    }
+  },
+  "required_semantic_checks": [
+    "transaction boundaries",
+    "foreign keys",
+    "NULL versus empty",
+    "sorting and text equality",
+    "time semantics",
+    "sequence start",
+    "BLOB to bytea",
+    "authorization and maintenance locks",
+    "audit ownership",
+    "schema privilege isolation"
+  ]
+}

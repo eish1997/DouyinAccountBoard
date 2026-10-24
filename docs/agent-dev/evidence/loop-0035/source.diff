@@ -1,0 +1,256 @@
+--- account_service.py.before
++++ account_service.py
+@@ -5,6 +5,70 @@
+ import auth
+ import uuid
+ STATES=['正常','养号7天','短期封禁','封禁','发不了','停用','待确认']
++
++PATCH_PERMISSIONS={**{key:'account_manage' for key in ('name','note','computer_id','slot','douyin_id','homepage','account_type','parent_account_id','registered_on','lifecycle_note','registration_phone','office_id')},
++    'status':'account_status','auxiliary_state':'account_progress','card_stability':'account_progress','password_state':'account_progress','phone_device_id':'device_manage'}
++
++
++def authorize_patch(db,actor,body):
++    auth.require(actor)
++    changes=body.get('changes')
++    if not isinstance(changes,dict) or not changes:raise ValueError('请提交需要修改的字段')
++    if set(changes)-PATCH_PERMISSIONS.keys():raise ValueError('包含不允许修改的字段')
++    for field,value in changes.items():
++        auth.require(actor,PATCH_PERMISSIONS[field])
++        if field=='slot':
++            if type(value) is not int:raise ValueError('账号位置必须为整数')
++        elif value is None and field in ('parent_account_id','phone_device_id','office_id'):pass
++        elif not isinstance(value,str):raise ValueError('字段格式不正确：'+field)
++    if 'office_id' in changes and not getattr(db,'scope_enabled',False):raise ValueError('当前模式未启用办公室范围')
++    return changes
++
++
++def patch(db,body,actor,day):
++    """Caller owns one admitted transaction, version check and audit boundary."""
++    auth.authorize_route(db,actor,'/api/account/patch',body)
++    changes=authorize_patch(db,actor,body);ident=str(body.get('id',''))
++    old=db.execute('SELECT * FROM accounts WHERE id=?',(ident,)).fetchone()
++    if not old:raise ValueError('账号不存在')
++    values={}
++    if 'name' in changes:
++        name=changes['name'].strip()
++        if not name or len(name)>100:raise ValueError('账号名称不能为空或超过100字')
++        values['name']=name
++    if 'note' in changes:
++        if len(changes['note'])>2000:raise ValueError('备注不能超过2000字')
++        values['note']=changes['note']
++    if 'status' in changes:
++        if changes['status'] not in STATES:raise ValueError('账号状态不正确')
++        values['status']=changes['status']
++        if changes['status']=='养号7天' and old['status']!='养号7天':values['nurture_started']=''
++    if {'computer_id','slot'}&changes.keys():
++        computer=changes.get('computer_id',old['computer_id']);slot=changes.get('slot',old['slot'] or 1)
++        if not 1<=slot<=100 or not db.execute('SELECT 1 FROM computers WHERE id=?',(computer,)).fetchone():raise ValueError('电脑或账号位置不正确')
++        values.update(computer_id=computer,slot=None if computer=='unassigned' else slot)
++    if 'homepage' in changes:values['homepage']=collection.normalize_homepage(changes['homepage'])
++    if 'douyin_id' in changes:
++        identity=changes['douyin_id'].strip()
++        if len(identity)>100 or any(c.isspace() for c in identity):raise ValueError('真实抖音号不能包含空格或超过100字')
++        if identity and identity!=old['douyin_id'] and db.execute('SELECT 1 FROM accounts WHERE douyin_id=? AND id<>?',(identity,ident)).fetchone():raise ValueError('这个抖音号已经在工作台中，请编辑已有账号')
++        values['douyin_id']=identity
++        if identity!=old['douyin_id'] and values.get('homepage',old['homepage'])==old['homepage']:values['homepage']=''
++    lifecycle=('account_type','parent_account_id','registered_on','auxiliary_state','lifecycle_note','registration_phone')
++    if set(lifecycle)&changes.keys():
++        resolved=account_lifecycle.validate(db,ident,changes,old,day,actor=actor)
++        values.update({key:value for key,value in zip(lifecycle,resolved) if value!=old[key]})
++    # A late readiness validation can still fail after the first SQL statement;
++    # the HTTP transaction rolls all fields and side effects back together.
++    if any(key in values and values[key]!=old[key] for key in ('douyin_id','homepage')):
++        values.update(work_count=None,last_collected='',last_attempted='',collection_state='',collection_error='')
++    if values:db.execute('UPDATE accounts SET '+','.join(key+'=?' for key in values)+' WHERE id=?',(*values.values(),ident))
++    if {'card_stability','password_state'}&changes.keys():phone_cards.update_readiness(db,ident,changes)
++    if 'phone_device_id' in changes and (changes['phone_device_id'] or None)!=(old['phone_device_id'] or None):phone_devices.assign(db,ident,changes['phone_device_id'])
++    if 'office_id' in changes:
++        import office_scope
++        office_scope.save_assignment(db,actor,'accounts',ident,changes)
++    return ident
+ 
+ def save(db,body,actor,day,create=False):
+     # Serialize identity validation and writes across request threads.
+--- auth.py.before
++++ auth.py
+@@ -224,6 +224,10 @@
+     if getattr(db,'scope_enabled',False):
+         import office_scope
+         office_scope.authorize_route(db,user,path,body)
++    if path=='/api/account/patch':
++        import account_service
++        account_service.authorize_patch(db,user,body)
++        return
+     if path=='/api/batch-edit':
+         import batch_edit
+         batch_edit.authorize(user,body)
+--- app.py.before
++++ app.py
+@@ -347,6 +347,8 @@
+                     operations.finish(self,db,actor,self.path,change_state)
+                     db.commit()
+                     return self.reply({'ok':True,**result})
++                elif self.path=='/api/account/patch':
++                    account_service.patch(db,body,actor,today())
+                 elif self.path=='/api/account/status':
+                     if body.get('status') not in STATES:raise ValueError('账号状态不正确')
+                     if not db.execute('SELECT 1 FROM accounts WHERE id=?',(str(body['id']),)).fetchone():raise ValueError('账号不存在')
+--- office_scope.py.before
++++ office_scope.py
+@@ -152,7 +152,7 @@
+ 
+ 
+ def record_offices(maps, table, row):
+-    kind = {'accounts':'accounts','phone_cards':'cards','phone_devices':'devices'}.get(table)
++    kind = {'accounts':'accounts','phone_cards':'cards','phone_devices':'devices','computers':'computers'}.get(table)
+     if kind:
+         return maps[kind].get(row['id'], [])
+     if table in ('daily','nurture_records'):
+@@ -267,6 +267,9 @@
+ 
+ def authorize_route(db, actor, path, body):
+     actor=current_user(db,actor)
++    if path=='/api/account/patch':
++        if not isinstance(body.get('changes'),dict):raise ValueError('请提交需要修改的字段')
++        body={**body['changes'],'id':body.get('id')};path='/api/account'
+     if path=='/api/batch-edit':
+         import batch_edit
+         kind,ids,changes=batch_edit.validate(body)
+--- operations.py.before
++++ operations.py
+@@ -6,9 +6,9 @@
+ from sql_dialect import history_account
+ from datetime import date,timedelta
+ 
+-TABLE_KEYS={'accounts':['id'],'phone_cards':['id'],'phone_devices':['id'],'daily':['account_id','day'],
++TABLE_KEYS={'computers':['id'],'accounts':['id'],'phone_cards':['id'],'phone_devices':['id'],'daily':['account_id','day'],
+             'publishing_layout':['batch','computer_id','slot'],'nurture_records':['account_id']}
+-PREFIX={'accounts':'account','phone_cards':'card','phone_devices':'device','daily':'daily','publishing_layout':'layout','nurture_records':'nurture'}
++PREFIX={'computers':'computer','accounts':'account','phone_cards':'card','phone_devices':'device','daily':'daily','publishing_layout':'layout','nurture_records':'nurture'}
+ 
+ 
+ class ConflictError(ValueError):pass
+@@ -54,6 +54,14 @@
+ 
+ 
+ def targets(db,path,body):
++    if path=='/api/account/patch':
++        changes=body.get('changes',{});ident=str(body.get('id',''))
++        keys=targets(db,'/api/account',{**changes,'id':ident})
++        old=db.execute('SELECT computer_id,parent_account_id FROM accounts WHERE id=?',(ident,)).fetchone()
++        for field,index,prefix in [('computer_id',0,'computer:'),('parent_account_id',1,'account:')]:
++            if field in changes and old:
++                keys += [prefix+str(value) for value in (old[index],changes[field]) if value and value!='unassigned']
++        return sorted(set(keys))
+     if path=='/api/batch-edit':
+         import batch_edit
+         return batch_edit.keys(body)
+@@ -116,7 +124,7 @@
+         context=office_scope.read_context(db,actor)
+         if entity and not context['global_access']:
+             prefix,sep,ident=entity.partition(':')
+-            kind={'account':'accounts','card':'cards','device':'devices','nurture':'accounts'}.get(prefix)
++            kind={'account':'accounts','card':'cards','device':'devices','computer':'computers','nurture':'accounts'}.get(prefix)
+             if not sep or kind is None:raise auth.AccessError('无权访问此资料历史',403)
+             office_scope.require_entity(db,actor,kind,ident)
+     daily_prefix='daily:'+entity.split(':',1)[1]+':%' if entity.startswith('account:') else ''
+--- static/app.js.before
++++ static/app.js
+@@ -17,13 +17,26 @@
+  $('selectedCount').textContent=`已选择 ${selected.size} 个账号`;$('selectAll').checked=accounts.length>0&&accounts.every(a=>selected.has(a.id));$('selectAll').indeterminate=selected.size>0&&!$('selectAll').checked;
+  document.querySelector('#boardView .footnote').textContent=layoutActive?'发布位置来自工作进度表。点击待匹配格子选择对应账号，确认后即可记录发布；空位表示原表没有发布安排。':'点击未发或已发切换当天记录。';$('boardView').hidden=page!=='board';$('accountsView').hidden=page!=='accounts';$('title').textContent=page==='board'?'每日发布看板':'账号管理';$('breadcrumb').textContent=page==='board'?'每日发布':'账号资料';$('panelTitle').textContent=page==='board'?'主机发布矩阵':'账号清单';$('subtitle').textContent=page==='board'?'以工作进度表的电脑行、发布设备列为准。待匹配格子保留原文，确认账号后才能记录发布。':'状态人工维护，按电脑统一筛选。修改会同步到每日发布看板。';document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('active',b.dataset.page===page));if(typeof renderBatchControls==='function')renderBatchControls();applyPermissions();
+ }
+-function edit(id){const a=data.accounts.find(a=>a.id===id)||{id:'',name:'',computer_id:'unassigned',slot:1,status:'待确认',douyin_id:'',homepage:'',note:''};lifecycleEdit(a);readinessEdit(a);phoneDeviceEdit(a);$('editId').value=a.id;$('editOfficeGroup').value=a.office_group||(a.id?'':activeOffice==='three'?'three':'');$('editTitle').textContent=a.id?`编辑账号 · ${a.name}`:'新增账号 / 小号';$('editName').value=a.name;$('editComputer').innerHTML=data.computers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');$('editComputer').value=a.computer_id;$('editSlot').value=a.slot||1;$('editStatus').innerHTML=data.statuses.map(s=>`<option>${esc(s)}</option>`).join('');$('editStatus').value=a.status;$('editDouyin').value=a.douyin_id;$('editHomepage').value=a.homepage;$('editNote').value=a.note;$('editError').textContent='';ScopeUI.mount('editForm',data,'accounts',a);$('editor').showModal();captureVersions('editor');applyAccountPermissions(a);}
++function edit(id){const a=data.accounts.find(a=>a.id===id)||{id:'',name:'',computer_id:'unassigned',slot:1,status:'待确认',douyin_id:'',homepage:'',note:''};lifecycleEdit(a);readinessEdit(a);phoneDeviceEdit(a);$('editId').value=a.id;$('editOfficeGroup').value=a.office_group||(a.id?'':activeOffice==='three'?'three':'');$('editTitle').textContent=a.id?`编辑账号 · ${a.name}`:'新增账号 / 小号';$('editName').value=a.name;$('editComputer').innerHTML=data.computers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');$('editComputer').value=a.computer_id;$('editSlot').value=a.slot||1;$('editStatus').innerHTML=data.statuses.map(s=>`<option>${esc(s)}</option>`).join('');$('editStatus').value=a.status;$('editDouyin').value=a.douyin_id;$('editHomepage').value=a.homepage;$('editNote').value=a.note;$('editError').textContent='';ScopeUI.mount('editForm',data,'accounts',a);$('editor').showModal();captureVersions('editor');applyAccountPermissions(a);accountEditBaseline=a.id?accountEditValues():{};}
+ document.addEventListener('click',async e=>{const collect=e.target.closest('[data-collect]');if(collect)await queue([collect.dataset.collect]);const nav=e.target.closest('[data-page]');if(nav){page=nav.dataset.page;render();}const editor=e.target.closest('[data-edit]');if(editor)edit(editor.dataset.edit);const toggle=e.target.closest('[data-publish]');if(toggle){const a=data.accounts.find(a=>a.id===toggle.dataset.publish);const body={id:a.id,date:data.date,published:!a.published};toggle.disabled=true;try{await api('/api/daily',body);await load();toast(body.published?'已记录为已发':'已取消发布标记');}catch(e){toast(e.message);}finally{toggle.disabled=false;}}});
+ $('accountsBody').addEventListener('change',e=>{if(e.target.dataset.select){const id=e.target.dataset.select;e.target.checked?selected.add(id):selected.delete(id);render();}});
+ $('selectAll').onchange=()=>{filtered().forEach(a=>$('selectAll').checked?selected.add(a.id):selected.delete(a.id));render();};
+ $('applyBulk').onclick=async()=>{if(!selected.size)return toast('请先勾选账号');try{await api('/api/bulk-status',{ids:[...selected],status:$('bulkStatus').value});selected.clear();await load();toast('账号状态已批量更新');}catch(e){toast(e.message);}};
+ $('closeDialog').onclick=()=>$('editor').close();
+-$('editForm').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{if($('editId').value&&!hasPermission('account_manage')){const a=data.accounts.find(a=>a.id===$('editId').value);if(!a)throw Error('没有新增账号权限');if(hasPermission('account_status')&&a.status!==$('editStatus').value)await api('/api/account/status',{id:a.id,status:$('editStatus').value});if(hasPermission('account_progress')){await api('/api/account/card-readiness',{id:a.id,card_stability:$('editCardStability').value,password_state:$('editPasswordState').value});if(a.account_type==='大号'&&a.effective_auxiliary_state!==$('editAux').value)await api('/api/lifecycle-status',{id:a.id,auxiliary_state:$('editAux').value});}}else{await api($('editId').value?'/api/account':'/api/account/create',{...ScopeUI.payload('editForm'),...lifecyclePayload(),...readinessPayload(),phone_device_id:$('editPhoneDevice').value,office_group:$('editOfficeGroup').value,id:$('editId').value,name:$('editName').value,computer_id:$('editComputer').value,slot:Number($('editSlot').value),status:$('editStatus').value,note:$('editNote').value,douyin_id:$('editDouyin').value,homepage:$('editHomepage').value});}$('editor').close();await load();toast('已保存，两个页面已同步');}catch(e){$('editError').textContent=e.message;}finally{button.disabled=false;}};
++let accountEditBaseline={};
++function accountEditValues(){return {...ScopeUI.payload('editForm'),...lifecyclePayload(),...readinessPayload(),phone_device_id:$('editPhoneDevice').value||null,name:$('editName').value,computer_id:$('editComputer').value,slot:Number($('editSlot').value),status:$('editStatus').value,note:$('editNote').value,douyin_id:$('editDouyin').value,homepage:$('editHomepage').value};}
++$('editForm').onsubmit=async event=>{
++ event.preventDefault();const button=event.submitter;button.disabled=true;
++ try{
++  const values=accountEditValues(),id=$('editId').value;
++  if(id){
++   const changes=Object.fromEntries(Object.entries(values).filter(([key,value])=>JSON.stringify(value)!==JSON.stringify(accountEditBaseline[key])));
++   if(!Object.keys(changes).length){$('editor').close();toast('没有需要保存的修改');return;}
++   await api('/api/account/patch',{id,changes});
++  }else await api('/api/account/create',{...values,office_group:$('editOfficeGroup').value});
++  $('editor').close();await load();toast('已保存，两个页面已同步');
++ }catch(error){$('editError').textContent=error.message;}finally{button.disabled=false;}
++};
+ accountSearchFields.forEach(id=>{$(id).oninput=()=>{activeLifecyclePreset='';render();};$(id).onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();activeLifecyclePreset='';render();}};});['computer','status','published','loginPhoneFilter','verificationFilter'].forEach(id=>$(id).onchange=render);$('date').onchange=()=>{selected.clear();load();};$('today').onclick=()=>{$('date').value=data.today;load();};$('refresh').onclick=load;$('clear').onclick=()=>{clearAccountSearch();activeLifecyclePreset='';['query','computer','status','published','accountType','lifecycleFilter','ageFilter','loginPhoneFilter'].forEach(id=>$(id).value='');selected.clear();render();};window.addEventListener('focus',()=>{if(data&&!$('editor').open&&!$('cardEditor').open&&!$('phoneDeviceEditor').open&&!$('publishingMatchDialog').open&&!$('verificationEditor')?.open&&!$('batchEditor')?.open)load();});load();
+ 
+ async function queue(ids){if(!ids.length)return toast('没有可采集的账号');try{const result=await api('/api/collection/enqueue',{ids});await load();toast('已加入 '+result.queued+' 个任务'+(result.missing?'；'+result.missing+' 个缺少真实抖音号或主页':''));}catch(e){toast(e.message);}}
+--- static/edit-versions.js.before
++++ static/edit-versions.js
+@@ -1,5 +1,11 @@
+ const capturedVersions=new Map();
+ function versionKeys(path,body,accounts){
++ if(path==='/api/account/patch'){
++  const changes=body.changes||{},id=String(body.id??''),old=accounts.find(account=>account.id===id);
++  const keys=versionKeys('/api/account',{...changes,id},accounts);
++  for(const [field,prefix] of [['computer_id','computer:'],['parent_account_id','account:']])if(field in changes)for(const value of [old?.[field],changes[field]])if(value&&value!=='unassigned')keys.push(prefix+value);
++  return [...new Set(keys)];
++ }
+  const id=String(body.id??''),keys=[];
+  if(path==='/api/batch-edit'){const prefix={cards:'card',devices:'device'}[body.kind]||'account';for(const value of body.ids||[]){keys.push(prefix+':'+value);if(body.kind==='verification')keys.push('nurture:'+value);if(body.kind==='daily')keys.push('daily:'+value+':'+body.patch.date);}return keys;}
+  if(path.startsWith('/api/workspace/nurture/'))keys.push('account:'+id,'nurture:'+id);
+--- test_auth_support.py.before
++++ test_auth_support.py
+@@ -24,6 +24,11 @@
+             if '_expected_versions' not in body and not urlparse(request.full_url).path.startswith('/api/auth/'):
+                 with original_open(base+'/api/board') as response:board=json.load(response)
+                 keys=[];path=urlparse(request.full_url).path;ident=str(body.get('id',''))
++                if path=='/api/account/patch':
++                    changes=body.get('changes',{});keys.append('account:'+ident)
++                    old=next((row for row in board['accounts'] if row['id']==ident),{})
++                    for field,prefix in [('computer_id','computer:'),('parent_account_id','account:'),('phone_device_id','device:')]:
++                        if field in changes:keys += [prefix+str(value) for value in (old.get(field),changes[field]) if value and value!='unassigned']
+                 if path=='/api/batch-edit':
+                     import batch_edit
+                     try:keys+=batch_edit.keys(body)
+--- pg_scope_read_checks.py.before
++++ pg_scope_read_checks.py
+@@ -143,6 +143,30 @@
+             assert post(employee_client,'/api/account/create',dict(create,office_id=office_a))[0]==200
+             new=next(row for row in get(employee_client,'/api/board')['accounts'] if row['name']=='合成范围新增')
+             assert new['office_ids']==[office_a]
++            limited=post(owner_client,'/api/auth/users',dict(username='synthetic_patch_employee',name='合成字段员工',password=test_auth_support.TEST_PASSWORD,permissions=['account_status','account_progress'],office_ids=[office_a]))
++            assert limited[0]==200,limited
++            patch_client=test_auth_support.client(base,'synthetic_patch_employee')
++            before_patch=get(patch_client,'/api/board')
++            old_version=before_patch['record_versions']['account:'+new['id']]
++            valid_patch=post(patch_client,'/api/account/patch',dict(id=new['id'],changes=dict(status='养号7天',card_stability='已稳定',password_state='已修改')))
++            assert valid_patch[0]==200,valid_patch
++            saved=next(row for row in get(patch_client,'/api/board')['accounts'] if row['id']==new['id'])
++            assert (saved['status'],saved['card_stability'],saved['password_state'])==('养号7天','已稳定','已修改')
++            invalid_patch=post(patch_client,'/api/account/patch',dict(id=new['id'],changes=dict(status='停用',password_state='invalid-synthetic')))
++            assert invalid_patch[0]==400,invalid_patch
++            assert post(patch_client,'/api/account/patch',dict(id=new['id'],changes=dict(status='停用',name='夹带无权字段')))[0]==403
++            assert post(patch_client,'/api/account/patch',dict(id=new['id'],changes=dict(status='停用',work_count=99)))[0]==400
++            assert post(patch_client,'/api/account/patch',dict(id=new['id'],changes=dict(status='停用'),_expected_versions={'account:'+new['id']:old_version}))[0]==409
++            current=next(row for row in get(patch_client,'/api/board')['accounts'] if row['id']==new['id'])
++            assert current['status']=='养号7天' and current['name']==new['name'] and current['password_state']=='已修改'
++            with runtime.connect() as raw_db:
++                raw_db.begin_write()
++                raw_db.execute("INSERT INTO accounts(id,name,status) VALUES('account-null','合成空值保留','正常')")
++                scope.assign_entity(raw_db,owner,'accounts','account-null',[office_a],newly_created=True);raw_db.commit()
++            assert post(patch_client,'/api/account/patch',dict(id='account-null',changes={'status':'停用'}))[0]==200
++            with runtime.connect() as raw_db:
++                raw=raw_db.execute("SELECT note,douyin_id,homepage,computer_id,slot FROM accounts WHERE id='account-null'").fetchone()
++                assert all(value is None for value in tuple(raw)),tuple(raw)
+             hidden_pair=post(employee_client,'/api/account/create',dict(create,name='禁止隐式越界配对',office_id=office_a,account_type='小号',registration_phone='19900000002'))
+             assert hidden_pair[0]==403,hidden_pair
+             assert not any(row['name']=='禁止隐式越界配对' for row in get(owner_client,'/api/board')['accounts'])
+@@ -257,6 +281,7 @@
+     if write_checks:checks+=['pending-entity-scope-assignment','stale-scope-version-conflict','single-office-constraint-rollback','scope-inventory-owner-only']
+     if write_checks:checks+=['single-office-create-survives-relogin','multi-office-create-survives-relogin','admin-global-read-action-limited','admin-cannot-grant','scope-revoked-during-real-lock-wait','fresh-session-rechecks-current-office']
+     if write_checks:checks+=['inferred-foreign-parent-rejected-and-rolled-back','inferred-authorized-parent-still-supported']
++    if write_checks:checks+=['atomic-patch-without-account-manage','late-field-failure-rolls-back','unauthorized-patch-field-rejects-all','unknown-patch-field-rejected','stale-patch-conflict','omitted-null-fields-preserved']
+     print(json.dumps({'passed':True,'kind':'core-scope-http-not-complete-export-history-acceptance','checks':checks},ensure_ascii=True))
+ 
+ 

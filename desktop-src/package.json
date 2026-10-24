@@ -1,0 +1,7 @@
+{
+  "name": "douyin-account-board",
+  "productName": "抖音账号工作台",
+  "version": "0.2.0",
+  "description": "本地抖音账号管理与每日发布矩阵",
+  "main": "main.cjs"
+}

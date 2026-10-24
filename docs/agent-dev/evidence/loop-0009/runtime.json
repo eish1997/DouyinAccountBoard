@@ -1,0 +1,17 @@
+{
+  "source": "https://get.enterprisedb.com/postgresql/postgresql-16.15-5-windows-x64-binaries.zip",
+  "discovery": "https://www.postgresql.org/download/windows/ -> https://www.enterprisedb.com/download-postgresql-binaries",
+  "version": "PostgreSQL 16.15",
+  "sha256": "43bb45f173a6f08cf1d29a97a6d8deb119e8e8093a24c00d2d1001a0ccaa8281",
+  "bytes": 373254386,
+  "location": ".local-tools/postgresql-16",
+  "extracted": [
+    "pgsql/bin",
+    "pgsql/lib",
+    "pgsql/share",
+    "top-level license txt"
+  ],
+  "global_install": false,
+  "windows_service_registered": false,
+  "cloudbase_version_match": "unknown"
+}

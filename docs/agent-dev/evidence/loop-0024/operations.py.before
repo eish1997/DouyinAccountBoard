@@ -1,0 +1,132 @@
+"""Business history and optimistic concurrency; authentication records are excluded."""
+import hashlib
+import json
+import time
+import uuid
+from sql_dialect import history_account
+from datetime import date,timedelta
+
+TABLE_KEYS={'accounts':['id'],'phone_cards':['id'],'phone_devices':['id'],'daily':['account_id','day'],
+            'publishing_layout':['batch','computer_id','slot'],'nurture_records':['account_id']}
+PREFIX={'accounts':'account','phone_cards':'card','phone_devices':'device','daily':'daily','publishing_layout':'layout','nurture_records':'nurture'}
+
+
+class ConflictError(ValueError):pass
+
+
+def encoded(value):return json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'))
+def token(value):return hashlib.sha256(encoded(value).encode()).hexdigest()
+def row_key(table,row):return PREFIX[table]+':'+':'.join(str(row[key]) for key in TABLE_KEYS[table])
+
+
+def migrate(db):
+    db.execute('''CREATE TABLE IF NOT EXISTS operations_history(id INTEGER PRIMARY KEY,group_id TEXT NOT NULL,
+      at INTEGER NOT NULL,actor_id INTEGER,actor_name TEXT NOT NULL,action TEXT NOT NULL,entity TEXT NOT NULL,
+      before_json TEXT,after_json TEXT)''')
+    db.execute('CREATE INDEX IF NOT EXISTS operations_history_entity ON operations_history(entity,id)')
+    db.execute('''CREATE TABLE IF NOT EXISTS operations_previews(id TEXT PRIMARY KEY,actor_id INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL)''')
+    if 'nurture_started' not in {row[1] for row in db.execute('PRAGMA table_info(accounts)')}:
+        db.execute("ALTER TABLE accounts ADD COLUMN nurture_started TEXT NOT NULL DEFAULT ''")
+
+
+def snapshot(db):
+    result={}
+    for table in TABLE_KEYS:
+        for row in db.execute('SELECT * FROM '+table):
+            value=dict(row);result[row_key(table,value)]=value
+    return result
+
+
+def versions(db):return {key:token(value) for key,value in snapshot(db).items()}
+
+
+def targets(db,path,body):
+    if path=='/api/batch-edit':
+        import batch_edit
+        return batch_edit.keys(body)
+    keys=[];ident=str(body.get('id',''))
+    if path.startswith('/api/workspace/nurture/'):keys+=['account:'+ident,'nurture:'+ident]
+    if path in ['/api/account','/api/account/status','/api/account/card-readiness','/api/lifecycle-status','/api/account/phone-device','/api/account/nurture']:
+        keys.append('account:'+ident)
+    if path=='/api/bulk-status':keys+=['account:'+str(value) for value in body.get('ids',[])]
+    if path=='/api/daily':keys+=['account:'+ident,'daily:'+ident+':'+str(body.get('date',''))]
+    if path=='/api/phone-card' and body.get('id'):keys.append('card:'+ident)
+    if path=='/api/phone-device':keys.append('device:'+ident)
+    if path in ['/api/account','/api/account/create','/api/account/phone-device'] and 'phone_device_id' in body:
+        old=db.execute('SELECT phone_device_id FROM accounts WHERE id=?',(ident,)).fetchone()
+        keys+=['device:'+str(value) for value in [old[0] if old else None,body.get('phone_device_id')] if value]
+    if path=='/api/publishing/assignment':
+        for computer,slot in [(body.get('computer_id'),body.get('slot')),(body.get('target_computer'),body.get('target_slot'))]:
+            if computer is not None and slot is not None:keys.append('layout:'+str(body.get('batch'))+':'+str(computer)+':'+str(slot))
+    return keys
+
+
+def before(db,path,body):
+    records=snapshot(db);keys=targets(db,path,body)
+    expected=body.get('_expected_versions')
+    if keys and not isinstance(expected,dict):raise ConflictError('页面版本过旧，请刷新后重新操作；未保存任何修改')
+    for key in keys:
+        if expected.get(key)!= (token(records[key]) if key in records else None):
+            raise ConflictError('这条资料已被其他人修改，请刷新核对后再保存；未覆盖对方修改')
+    return records,keys
+
+
+def finish(handler,db,actor,path,state):
+    import nurture
+    from app import today
+    nurture.sync(db,today())
+    old,checked=state;new=snapshot(db);changed=[key for key in old.keys()|new.keys() if old.get(key)!=new.get(key)]
+    group=uuid.uuid4().hex;now=int(time.time())
+    for key in changed:
+        db.execute('INSERT INTO operations_history(group_id,at,actor_id,actor_name,action,entity,before_json,after_json) VALUES(?,?,?,?,?,?,?,?)',
+          (group,now,actor['id'] if actor else None,actor['name'] if actor else '采集服务',path,key,
+           encoded(old.get(key)),encoded(new.get(key))))
+    handler._version_delta={key:token(new[key]) if key in new else None for key in set(changed)|set(checked)}
+
+
+def history(db,entity='',before_id=0):
+    daily_prefix='daily:'+entity.split(':',1)[1]+':%' if entity.startswith('account:') else ''
+    account_id=entity.split(':',1)[1] if entity.startswith('account:') else ''
+    rows=db.execute("SELECT * FROM operations_history WHERE (?=? OR entity=? OR entity=? OR (?<>? AND entity LIKE ?) OR (?<>'' AND entity LIKE 'layout:%' AND ("+history_account(db,'before_json')+"=? OR "+history_account(db,'after_json')+"=?))) AND (?=0 OR id<?) ORDER BY id DESC LIMIT 100",
+                    (entity,'',entity,'nurture:'+account_id if account_id else '',daily_prefix,'',daily_prefix,account_id,account_id,account_id,before_id,before_id)).fetchall()
+    result=[]
+    for row in rows:
+        value=dict(row);old=json.loads(value.pop('before_json'));new=json.loads(value.pop('after_json'))
+        value['changes']=[dict(field=key,before=(old or {}).get(key),after=(new or {}).get(key)) for key in sorted((old or {}).keys()|(new or {}).keys()) if (old or {}).get(key)!=(new or {}).get(key)]
+        result.append(value)
+    return dict(entries=result,next_before=rows[-1]['id'] if len(rows)==100 else 0)
+
+
+def preview(db,actor,kind,payload):
+    ident=uuid.uuid4().hex;db.execute('DELETE FROM operations_previews WHERE expires_at<?',(int(time.time()),))
+    db.execute('INSERT INTO operations_previews VALUES(?,?,?,?,?)',(ident,actor['id'],int(time.time())+1800,kind,encoded(payload)))
+    return ident
+
+
+def take_preview(db,actor,ident,kind):
+    row=db.execute('SELECT * FROM operations_previews WHERE id=? AND actor_id=? AND kind=? AND expires_at>?',(ident,actor['id'],kind,int(time.time()))).fetchone()
+    if not row:raise ValueError('预览已过期或不属于当前登录人员，请重新预览')
+    return json.loads(row['payload'])
+
+
+def assignments(db,body,actor_id):
+    import publishing_layout
+    state=db.execute('SELECT batch FROM publishing_layout_state WHERE id=1').fetchone()
+    if not state or body.get('batch')!=state['batch']:raise ConflictError('发布安排批次已更新，请刷新')
+    if type(body.get('slot')) is not int:raise ValueError('发布位置不正确')
+    key=(state['batch'],str(body.get('computer_id','')),body['slot'])
+    source=db.execute('SELECT * FROM publishing_layout WHERE batch=? AND computer_id=? AND slot=?',key).fetchone()
+    if not source or not source['account_id']:raise ValueError('请选择已关联账号的发布位置')
+    if body.get('action') not in ['move','remove']:raise ValueError('位置操作不正确')
+    if body['action']=='move':
+        if type(body.get('target_slot')) is not int:raise ValueError('目标位置不正确')
+        target_key=(key[0],str(body.get('target_computer','')),body['target_slot'])
+        target=db.execute('SELECT * FROM publishing_layout WHERE batch=? AND computer_id=? AND slot=?',target_key).fetchone()
+        if not target or target['account_id'] or target['label'].strip():raise ConflictError('目标不是空白发布格，请选择空白位置')
+        if key[1].startswith('office3:')!=target_key[1].startswith('office3:'):raise ValueError('不同设备批次不能混用发布电脑')
+        db.execute('UPDATE publishing_layout SET account_id=?,label=?,office=?,reason=? WHERE batch=? AND computer_id=? AND slot=?',
+                   (source['account_id'],source['label'],source['office'],'',*target_key))
+        db.execute('INSERT INTO publishing_layout_links VALUES(?,?,?,?,?,?)',(*target_key,target['reason'],actor_id,int(time.time())))
+    db.execute("UPDATE publishing_layout SET account_id=NULL,label='',reason='' WHERE batch=? AND computer_id=? AND slot=?",key)
+    db.execute('DELETE FROM publishing_layout_links WHERE batch=? AND computer_id=? AND slot=?',key)

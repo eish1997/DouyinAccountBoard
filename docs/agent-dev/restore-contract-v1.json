@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "status": "design_contract_not_runtime_implementation",
+  "source_schema": "loop-0008 synthetic SQLite schema inspection",
+  "unknown_tables": "reject_before_restore",
+  "business_restore_and_fingerprint": ["accounts", "computers", "daily", "phone_cards", "phone_devices", "publishing_layout", "publishing_layout_links", "publishing_layout_state", "nurture_records", "nurture_images", "offices", "account_offices", "computer_offices", "phone_card_offices", "phone_device_offices"],
+  "historical_tasks_restore": {"tables": ["collection_jobs"], "fingerprint": true, "keep_historical_state": true, "invalidate_execution_tokens": true, "execution_enabled": false},
+  "preserve_current_control": ["auth_users", "auth_sessions", "auth_limits", "auth_setup", "auth_migrations", "imports", "collection_settings", "user_office_grants", "schema_migrations", "runtime_control"],
+  "preserve_append_only_audit": ["auth_audit", "operations_history"],
+  "invalidate_after_restore": ["operations_previews", "collection_worker"],
+  "planned_tables_require_explicit_classification": {"offices_and_entity_office_mapping": "business_restore_with_current_grant_reference_validation", "user_office_grants": "preserve_current_control", "runtime_control": "preserve_maintenance_and_increment_restore_generation", "idempotency_records": "preserve_old_generation_tombstones_but_deny_replay_and_old_results", "schema_migrations": "preserve_current_control"},
+  "business_restore": {"requires_maintenance": true, "drain_inflight_writes": true, "timeout_keeps_maintenance": true, "pre_restore_backup_verified": true, "current_grants_missing_restored_office": "remain_in_maintenance_for_admin_review", "restore_generation": "new_generation_on_success", "failure": "remain_in_maintenance", "reopen": "explicit_admin_action"},
+  "disaster_restore": {"scope": "all_application_owned_schemas_and_files_including_application_identity_tables", "exclude_platform_owned_schemas": ["auth", "storage"], "restore_to_isolated_target": true, "revoke_recovered_sessions": true, "new_restore_generation": true, "start_in_maintenance": true, "validate_files_and_relationships_before_open": true}
+}

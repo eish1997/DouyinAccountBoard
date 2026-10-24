@@ -1,0 +1,16 @@
+.git
+.venv
+.venv-release
+.local-tools
+.synthetic-tests
+data
+backups
+logs
+desktop
+desktop-profile
+artifacts
+optional
+docs
+**/*.db
+**/.env
+**/node_modules

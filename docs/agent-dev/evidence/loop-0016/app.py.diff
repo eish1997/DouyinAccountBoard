@@ -1,0 +1,61 @@
+--- app.py.before
++++ app.py
+@@ -19,6 +19,7 @@
+ import workspace_service
+ import nurture
+ from release_policy import COLLECTION_MESSAGE
++from sql_dialect import begin_write, integer_order, integrity_errors
+ 
+ ROOT = Path(__file__).resolve().parent
+ DB = Path(os.environ['DOUYIN_BOARD_DATA_DIR']) / 'board.db' if os.environ.get('DOUYIN_BOARD_DATA_DIR') else None
+@@ -165,8 +166,9 @@
+             date.fromisoformat(day)
+             with connect() as db:
+                 db.execute('BEGIN')
+-                computers = [dict(r) for r in db.execute("SELECT * FROM computers ORDER BY CASE WHEN id LIKE 'office3:%' THEN 1 ELSE 0 END,CAST(CASE WHEN id LIKE 'office3:%' THEN substr(id,9) ELSE id END AS INTEGER),id")]
+-                accounts = [dict(r) for r in db.execute('SELECT a.*,COALESCE(d.published,0) AS published FROM accounts a LEFT JOIN daily d ON d.account_id=a.id AND d.day=? ORDER BY CAST(a.computer_id AS INTEGER),a.slot', (day,))]
++                computer_order=integer_order(db,"CASE WHEN id LIKE 'office3:%' THEN substr(id,9) ELSE id END")
++                computers = [dict(r) for r in db.execute("SELECT * FROM computers ORDER BY CASE WHEN id LIKE 'office3:%' THEN 1 ELSE 0 END,"+computer_order+",id")]
++                accounts = [dict(r) for r in db.execute('SELECT a.*,COALESCE(d.published,0) AS published FROM accounts a LEFT JOIN daily d ON d.account_id=a.id AND d.day=? ORDER BY '+integer_order(db,'a.computer_id')+',a.slot', (day,))]
+                 collection_info=collection.overview(db)
+                 account_lifecycle.enrich(accounts, today())
+                 card_info=phone_cards.overview(db)
+@@ -184,7 +186,7 @@
+     def auth_post(self,body):
+         secure=os.environ.get('DOUYIN_BOARD_PUBLIC_ORIGIN','').startswith('https://')
+         with connect() as db:
+-            db.execute('BEGIN IMMEDIATE')
++            begin_write(db)
+             def finish(value,status=200,headers=None):
+                 db.commit()
+                 return self.reply(value,status,headers)
+@@ -238,10 +240,11 @@
+             if self.path.startswith('/api/auth/'):
+                 return self.auth_post(body)
+             with connect() as db:
++                # Wait for write admission before reading sessions or permissions.
++                begin_write(db)
+                 actor=None
+                 if self.path=='/api/collection/heartbeat':
+                     if not self.is_worker():return self.reply({'error':'仅采集服务可调用'},403)
+-                    db.execute('BEGIN IMMEDIATE')
+                     return self.reply(collection.heartbeat(db,body.get('status')))
+                 if self.path!='/api/collection/result':
+                     actor=auth.session(db,self.headers.get('Cookie'));auth.require(actor)
+@@ -252,7 +255,6 @@
+                     auth.audit(db,actor,'导出业务资料',str(body.get('kind')))
+                     db.commit()
+                     return self.reply(result)
+-                db.execute('BEGIN IMMEDIATE')
+                 change_state=operations.before(db,self.path,body)
+                 if self.path=='/api/batch-edit':
+                     import batch_edit
+@@ -363,7 +365,7 @@
+             self.reply({'error':str(e)},409)
+         except auth.AccessError as e:
+             self.reply({'error':str(e)},e.status)
+-        except sqlite3.IntegrityError:
++        except integrity_errors():
+             self.reply({'error':'这个电脑位置已经有账号，请选择空位'},400)
+         except (ValueError,KeyError,TypeError) as e:
+             self.reply({'error':str(e)},400)

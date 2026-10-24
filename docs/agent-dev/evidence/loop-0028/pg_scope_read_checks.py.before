@@ -1,0 +1,192 @@
+"""Scoped board/image/status HTTP checks using the configured PG provider."""
+import json
+import base64
+import os
+import sys
+import threading
+import urllib.error
+import urllib.request
+from test_isolation import checked_root, install
+from pg_synthetic_migration import connect_synthetic, install_schema
+from pg_service_adapter import ServiceConnection
+from pg_runtime import PostgresRuntime
+
+
+def main(write_checks=False):
+    root=checked_root();install(root)
+    import app
+    import auth
+    import office_scope as scope
+    import test_auth_support
+    from test_release_core import png
+    secret='合成B范围外不可见标记'
+    with connect_synthetic() as conn:
+        install_schema(conn);conn.execute('SET search_path=board_candidate,pg_catalog')
+        db=ServiceConnection(conn,writer_epoch=1,restore_generation='synthetic-read-1',schema='board_candidate')
+        with conn.transaction():
+            setup=auth.mint_setup(db)
+            token=auth.setup_owner(db,dict(username='test_owner',password=test_auth_support.TEST_PASSWORD),'board_setup='+setup)
+            owner=auth.session(db,'board_session='+token)
+            employee=auth.save_user(db,owner,dict(username='synthetic_employee',password=test_auth_support.TEST_PASSWORD))
+            auth.save_user(db,owner,dict(username='synthetic_viewer',role='viewer',password=test_auth_support.TEST_PASSWORD))
+            for ident,name in [('pc-a','合成电脑A'),('pc-b',secret)]:db.execute('INSERT INTO computers(id,name) VALUES(?,?)',(ident,name))
+            for ident,name in [('1','合成共用手机'),('2',secret)]:db.execute('INSERT INTO phone_devices(id,name) VALUES(?,?)',(ident,name))
+            db.execute("INSERT INTO accounts(id,name,computer_id,phone_device_id,status,douyin_id,registration_phone) VALUES('account-b',?,'pc-b','1','正常','synthetic-b','19900000002')",(secret,))
+            db.execute("INSERT INTO accounts(id,name,computer_id,phone_device_id,parent_account_id,status,douyin_id,registration_phone) VALUES('account-a','合成账号A','pc-b','2','account-b','正常','synthetic-a','19900000001')")
+            db.execute("INSERT INTO accounts(id,name,office_group) VALUES('account-unknown',?,'three')",(secret,))
+            db.execute("INSERT INTO phone_cards(id,phone,label) VALUES(1,'13800000001','合成共用卡')")
+            db.execute("INSERT INTO phone_cards(id,phone,label) VALUES(2,'13800000002',?)",(secret,))
+            # Explicit fixture IDs must advance the identity just as migration does.
+            db.execute('ALTER TABLE phone_cards ALTER COLUMN id RESTART WITH 3')
+            db.execute('INSERT INTO collection_settings(id,auto_enabled) VALUES(1,0)');db.execute('INSERT INTO collection_worker(id) VALUES(1)')
+            for ident in ('account-a','account-b'):
+                db.execute("INSERT INTO collection_jobs(account_id,homepage,token,state) VALUES(?,'','synthetic-inert','queued')",(ident,))
+                db.execute('INSERT INTO nurture_records(account_id,image_count) VALUES(?,1)',(ident,))
+                db.execute("INSERT INTO nurture_images VALUES(?,?,1,'2026-10-21','image/png',?,'合成人员')",('image-'+ident,ident,png()))
+            db.execute("UPDATE accounts SET status='封禁' WHERE id='account-b'")
+            db.execute("UPDATE nurture_records SET workflow='运行',active_since='2026-10-21',started_on='2026-10-21' WHERE account_id='account-b'")
+            db.execute("INSERT INTO publishing_layout_state VALUES(1,'synthetic-batch')")
+            db.execute("INSERT INTO publishing_layout VALUES('synthetic-batch','pc-a',1,'account-a','合成格子A','','','','')")
+            db.execute("INSERT INTO publishing_layout VALUES('synthetic-batch','pc-a',2,'account-b',?,'','','','')",(secret,))
+            db.execute("UPDATE runtime_control SET mode='open',restore_generation='synthetic-read-1'")
+            db.execute("INSERT INTO operations_history(group_id,at,actor_name,action,entity,before_json,after_json) VALUES('legacy',1,'合成人员','legacy','account:account-a','null',?)",(json.dumps(dict(id='account-a',name=secret)),))
+        db.begin_write()
+        office_a=scope.create_office(db,owner,'合成办公室A');office_b=scope.create_office(db,owner,secret)
+        for kind,ident,offices in [('accounts','account-a',[office_a]),('accounts','account-b',[office_b]),
+            ('computers','pc-a',[office_a]),('computers','pc-b',[office_b]),('devices','1',[office_a,office_b]),
+            ('devices','2',[office_b]),('cards',1,[office_a,office_b]),('cards',2,[office_b])]:
+            scope.assign_entity(db,owner,kind,ident,offices)
+        scope.grant_user(db,owner,employee,[office_a]);db.commit()
+    runtime=PostgresRuntime(dict(host='127.0.0.1',port=int(os.environ['PGPORT']),database='synthetic_probe',user='synthetic_owner',schema='board_candidate',writer_epoch=1,restore_generation='synthetic-read-1',connection_limit=3,synthetic_root=str(root)),{'DOUYIN_BOARD_DATABASE_PASSWORD':os.environ['PGPASSWORD']})
+    app.configure_database(runtime);app.initialize()
+    class QuietHandler(app.Handler):
+        def log_message(self,*args):pass
+    server=app.ThreadingHTTPServer(('127.0.0.1',0),QuietHandler);thread=threading.Thread(target=server.serve_forever);thread.start()
+    try:
+        base='http://127.0.0.1:'+str(server.server_port)
+        employee_client=test_auth_support.client(base,'synthetic_employee')
+        viewer=test_auth_support.client(base,'synthetic_viewer')
+        owner_client=test_auth_support.client(base)
+        def get(client,path):
+            with client.open(base+path,timeout=10) as response:return json.load(response)
+        board=get(employee_client,'/api/board')
+        assert [row['id'] for row in board['accounts']]==['account-a']
+        account=board['accounts'][0]
+        assert account['computer_id']=='unassigned' and account['parent_account_id'] is None and account['phone_device_id'] is None
+        assert account['parent_name']==''
+        assert [row['id'] for row in board['phone_cards']['cards']]==[1]
+        assert board['phone_cards']['importable']==1
+        assert [row['id'] for row in board['phone_devices']['devices']]==['1']
+        assert board['phone_devices']['devices'][0]['account_count']==0
+        assert len(board['publishing_layout']['cells'])==1
+        assert [row['account_id'] for row in board['nurture']['records']]==['account-a']
+        assert board['collection']['waiting']==1 and board['collection']['linked']==1
+        serialized=json.dumps(board,ensure_ascii=False)
+        assert secret not in serialized and 'account-b' not in serialized and 'pc-b' not in serialized
+        assert all('account-b' not in key for key in board['record_versions'])
+        empty=get(viewer,'/api/board')
+        assert not empty['accounts'] and not empty['computers'] and not empty['record_versions'] and not empty['offices']
+        assert empty['publishing_layout']==dict(enabled=False,cells=[])
+        assert not empty['phone_cards']['cards'] and not empty['phone_devices']['devices'] and not empty['nurture']['records']
+        assert secret in json.dumps(get(owner_client,'/api/board'),ensure_ascii=False)
+        try:
+            employee_client.open(base+'/api/nurture/image?id=image-account-b',timeout=10)
+            raise AssertionError('Cross-office image served')
+        except urllib.error.HTTPError as error:assert error.code==403
+        with employee_client.open(base+'/api/nurture/image?id=image-account-a',timeout=10) as response:assert response.read()==png()
+        status=get(employee_client,'/api/collection/status')['collection']
+        assert status['waiting']==1 and status['linked']==1
+        if write_checks:
+            def post(client,path,body):
+                request=urllib.request.Request(base+path,data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+                try:
+                    with client.open(request,timeout=10) as response:return response.status,json.load(response)
+                except urllib.error.HTTPError as error:return error.code,json.load(error)
+            update=dict(id=employee,name='合成员工',permissions=list(auth.PERMISSIONS),office_ids=[office_a])
+            assert post(owner_client,'/api/auth/users',update)[0]==200
+            employee_client=test_auth_support.client(base,'synthetic_employee')
+            day=get(employee_client,'/api/board')['today']
+            assert post(employee_client,'/api/daily',dict(id='account-b',date=day,published=True))[0]==403
+            assert post(employee_client,'/api/batch-edit',dict(kind='accounts',ids=['account-a','account-b'],patch={'status':'停用'}))[0]==403
+            assert get(employee_client,'/api/board')['accounts'][0]['status']=='正常'
+            assert post(employee_client,'/api/phone-card',dict(id=1,phone='13800000001',status='正常'))[0]==403
+            assert post(employee_client,'/api/phone-device',dict(id='1',state='在用'))[0]==403
+            create=dict(name='合成范围新增',computer_id='pc-a',slot=1,status='正常')
+            assert post(employee_client,'/api/account/create',create)[0]==400
+            assert post(employee_client,'/api/account/create',dict(create,office_id=office_b))[0]==403
+            assert post(employee_client,'/api/account/create',dict(create,office_id=office_a))[0]==200
+            new=next(row for row in get(employee_client,'/api/board')['accounts'] if row['name']=='合成范围新增')
+            assert new['office_ids']==[office_a]
+            card_created=post(employee_client,'/api/phone-card',dict(phone='19900000003',office_ids=[office_a]))
+            assert card_created[0]==200,card_created
+            assert post(employee_client,'/api/phone-device/create',dict(id='3',state='在用',office_ids=[office_a]))[0]==200
+            assert post(employee_client,'/api/account/phone-device',dict(id=new['id'],phone_device_id='3'))[0]==200
+            assert post(employee_client,'/api/account/phone-device',dict(id=new['id'],phone_device_id='2'))[0]==403
+            moved=post(employee_client,'/api/account',dict(create,id=new['id'],name='must-rollback',office_id=office_b))
+            assert moved[0]==403,moved
+            check=next(row for row in get(employee_client,'/api/board')['accounts'] if row['id']==new['id'])
+            assert check['name']=='合成范围新增' and check['office_ids']==[office_a] and check['phone_device_id']=='3'
+            with runtime.connect() as check_db:
+                assert check_db.execute("SELECT workflow FROM nurture_records WHERE account_id='account-b'").fetchone()[0]=='运行'
+                assert check_db.execute("SELECT count(*) FROM operations_history WHERE entity='account:account-b'").fetchone()[0]==0
+                assert check_db.execute('SELECT scope_offices FROM operations_history WHERE entity=? ORDER BY id LIMIT 1',('account:'+new['id'],)).fetchone()[0]==json.dumps([office_a],ensure_ascii=False,separators=(',',':'))
+            history=get(employee_client,'/api/workspace/history')
+            assert history['entries'] and secret not in json.dumps(history,ensure_ascii=False)
+            assert all(item['group_id']!='legacy' for item in history['entries'])
+            try:get(employee_client,'/api/workspace/history?entity=account:account-b');raise AssertionError('foreign history accepted')
+            except urllib.error.HTTPError as error:assert error.code==403
+            assert secret in json.dumps(get(owner_client,'/api/workspace/history'),ensure_ascii=False)
+            exported=post(employee_client,'/api/workspace/export',dict(kind='accounts',format='csv'))
+            assert exported[0]==200,exported
+            csv_text=base64.b64decode(exported[1]['content']).decode('utf-8-sig')
+            assert '合成账号A' in csv_text and '合成范围新增' in csv_text
+            assert secret not in csv_text and 'account-b' not in csv_text and 'pc-b' not in csv_text
+            assert post(employee_client,'/api/workspace/export',dict(kind='accounts',format='csv',ids=['account-a','account-b']))[0]==403
+            for kind,own,foreign in [('cards','13800000001','13800000002'),('devices','合成共用手机',secret)]:
+                exported=post(employee_client,'/api/workspace/export',dict(kind=kind,format='csv'))
+                assert exported[0]==200,exported
+                text=base64.b64decode(exported[1]['content']).decode('utf-8-sig')
+                assert own in text and foreign not in text
+            def preview_csv(text,**scope_fields):
+                result=post(employee_client,'/api/workspace/import-preview',dict(kind='accounts',filename='synthetic.csv',content=base64.b64encode(text.encode('utf-8-sig')).decode(),**scope_fields))
+                assert result[0]==200,result
+                return result[1]
+            content='抖音号,昵称\nsynthetic-import-one,合成导入新增\n'
+            assert preview_csv(content)['rows'][0]['action']=='error'
+            assert preview_csv(content,office_id=office_b)['rows'][0]['action']=='error'
+            preview=preview_csv(content,office_id=office_a)
+            assert preview['rows'][0]['action']=='create',preview
+            applied=post(employee_client,'/api/workspace/import-apply',dict(preview_id=preview['preview_id'],rows=[2]))
+            assert applied[0]==200,applied
+            imported=next(row for row in get(employee_client,'/api/board')['accounts'] if row['douyin_id']=='synthetic-import-one')
+            assert imported['office_ids']==[office_a]
+            denied=preview_csv('内部编号,昵称\naccount-b,合成拒绝修改\n',office_id=office_a)
+            assert denied['rows'][0]['action']=='error' and denied['rows'][0]['changes']==[]
+            assert secret not in json.dumps(denied,ensure_ascii=False) and 'identity' not in denied['rows'][0]
+            denied=preview_csv('内部编号,关联大号编号\naccount-a,account-b\n',office_id=office_a)
+            assert denied['rows'][0]['action']=='error' and denied['rows'][0]['changes']==[]
+            pending=preview_csv('抖音号,昵称\nsynthetic-import-revoked,合成撤权拒绝\n',office_id=office_a)
+            assert pending['rows'][0]['action']=='create'
+            assert post(owner_client,'/api/auth/users',dict(update,office_ids=[office_b]))[0]==200
+            employee_client=test_auth_support.client(base,'synthetic_employee')
+            assert post(employee_client,'/api/workspace/import-apply',dict(preview_id=pending['preview_id'],rows=[2]))[0]==403
+            assert not any(row['douyin_id']=='synthetic-import-revoked' for row in get(owner_client,'/api/board')['accounts'])
+            assert post(owner_client,'/api/auth/users',dict(update,office_ids=[office_a,office_b]))[0]==200
+            employee_client=test_auth_support.client(base,'synthetic_employee')
+            assert post(employee_client,'/api/phone-card',dict(id=1,phone='13800000001',status='正常'))[0]==200
+    finally:
+        server.shutdown();server.server_close();thread.join(timeout=5)
+        assert not thread.is_alive()
+    checks=[
+        'board-office-filter','related-parent-device-computer-masked','shared-entity-filtered-counts',
+        'publishing-and-nurture-filter','version-keys-no-foreign-records','no-scope-empty-board',
+        'owner-cross-office-visible','cross-office-image-403-own-image-bytes','collection-status-scoped']
+    if write_checks:checks+=['http-user-office-grant','cross-office-write-403','mixed-batch-no-partial-write',
+        'shared-write-requires-all-offices','create-explicit-authorized-office','new-card-device-office',
+        'relation-does-not-change-scope','failed-office-change-rolls-back-fields','no-out-of-scope-nurture-sync','history-scope-stamped']
+    if write_checks:checks+=['history-unknown-admin-only','foreign-history-denied','export-relations-masked','mixed-export-denied','shared-card-device-export-scoped']
+    if write_checks:checks+=['import-explicit-office','import-new-scope-persisted','import-foreign-preview-redacted','import-relation-error-redacted','import-rechecks-revoked-scope']
+    print(json.dumps({'passed':True,'kind':'core-scope-http-not-complete-export-history-acceptance','checks':checks},ensure_ascii=True))
+
+
+if __name__=='__main__':main('--writes' in sys.argv)

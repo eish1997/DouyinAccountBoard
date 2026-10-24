@@ -1,0 +1,59 @@
+"""Authenticated HTTP fixture; never used by the runtime."""
+import http.cookiejar
+import json
+import urllib.request
+import auth
+import operations
+from urllib.parse import urlparse
+
+TEST_PASSWORD='test-only-password-2026'
+
+
+def client(base,username='test_owner',password=TEST_PASSWORD):
+    opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    request=urllib.request.Request(base+'/api/auth/login',data=json.dumps(dict(username=username,password=password)).encode(),headers={'Content-Type':'application/json'})
+    with opener.open(request) as response:json.load(response)
+    with opener.open(base+'/api/auth/me') as response:state=json.load(response)
+    opener.addheaders=[('X-CSRF-Token',state['user']['csrf'])]
+    # Existing behavioral tests send the current record version. Conflict tests
+    # supply explicit stale tokens and bypass this convenience.
+    original_open=opener.open
+    def versioned_open(request,*args,**kwargs):
+        if isinstance(request,urllib.request.Request) and request.data and request.headers.get('Content-type','').startswith('application/json'):
+            body=json.loads(request.data)
+            if '_expected_versions' not in body and not urlparse(request.full_url).path.startswith('/api/auth/'):
+                with original_open(base+'/api/board') as response:board=json.load(response)
+                keys=[];path=urlparse(request.full_url).path;ident=str(body.get('id',''))
+                if path=='/api/account/patch':
+                    changes=body.get('changes',{});keys.append('account:'+ident)
+                    old=next((row for row in board['accounts'] if row['id']==ident),{})
+                    for field,prefix in [('computer_id','computer:'),('parent_account_id','account:'),('phone_device_id','device:')]:
+                        if field in changes or field=='computer_id' and 'slot' in changes:keys += [prefix+str(value) for value in (old.get(field),changes.get(field,old.get(field))) if value and value!='unassigned']
+                if path=='/api/batch-edit':
+                    import batch_edit
+                    try:keys+=batch_edit.keys(body)
+                    except ValueError:pass
+                if path.startswith('/api/workspace/nurture/'):keys+=['account:'+ident,'nurture:'+ident]
+                if path in ['/api/account','/api/account/status','/api/account/card-readiness','/api/lifecycle-status','/api/account/phone-device','/api/account/nurture']:keys.append('account:'+ident)
+                if path=='/api/bulk-status':keys+=['account:'+str(value) for value in body.get('ids',[])]
+                if path=='/api/daily':keys+=['account:'+ident,'daily:'+ident+':'+str(body.get('date',''))]
+                if path=='/api/phone-card' and body.get('id'):keys.append('card:'+ident)
+                if path=='/api/phone-device':keys.append('device:'+ident)
+                if path in ['/api/account','/api/account/create','/api/account/phone-device'] and 'phone_device_id' in body:
+                    old=next((a for a in board['accounts'] if a['id']==ident),{})
+                    keys+=['device:'+str(value) for value in [old.get('phone_device_id'),body.get('phone_device_id')] if value]
+                if path=='/api/publishing/assignment':
+                    keys+=['layout:'+str(body.get('batch'))+':'+str(computer)+':'+str(slot) for computer,slot in [(body.get('computer_id'),body.get('slot')),(body.get('target_computer'),body.get('target_slot'))] if computer is not None and slot is not None]
+                body['_expected_versions']={key:board['record_versions'].get(key) for key in keys}
+                request.data=json.dumps(body).encode()
+        return original_open(request,*args,**kwargs)
+    opener.open=versioned_open
+    return opener
+
+
+def owner_client(module,base):
+    with module.connect() as db:
+        if not auth.initialized(db):
+            token=auth.mint_setup(db)
+            auth.setup_owner(db,dict(username='test_owner',name='测试总管理员',password=TEST_PASSWORD),'board_setup='+token)
+    return client(base)

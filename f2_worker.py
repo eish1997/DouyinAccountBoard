@@ -1,0 +1,132 @@
+"""Interactive-host F2 queue consumer. Credentials stay on the host, never in the UI."""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.request import Request, build_opener, ProxyHandler
+from urllib.error import HTTPError
+from release_policy import require_collection
+
+ROOT=Path(__file__).resolve().parent
+RUNTIME=Path('E:/douyin-f2-counts/.venv/Scripts/python.exe')
+SCRIPT=Path('E:/douyin-f2-counts/douyin-f2-counts/scripts/douyin_counts.py')
+PROFILE=Path('E:/douyin-f2-counts/private-profile')
+OUTPUT=Path('E:/Downloads/DouyinBoardCollections')
+ERRORS={'SearchNeedsVerification':'抖音搜索需要安全验证，请在服务器采集浏览器中手动完成',
+        'LoginRequired':'抖音登录已失效，请在服务器采集浏览器重新登录',
+        'SearchUnavailable':'没有搜索到抖音号完全一致的账号，请核对真实抖音号',
+        'IdentityMismatch':'账号身份校验失败，未更新数量',
+        'ProfileUnavailable':'公开作品数量不可用或账号私密'}
+
+def result_body(job,row):
+    body={'account_id':job['account_id'],'token':job['token']}
+    if row.get('status')=='success':
+        if job['douyin_id'] and row.get('account')!=job['douyin_id']:
+            return {**body,'error':ERRORS['IdentityMismatch']}
+        return {**body,'count':row.get('count'),'source_url':row.get('url'),
+                'matched_douyin_id':row.get('account')}
+    error=row.get('error','RuntimeError')
+    message=ERRORS.get(error,'采集未完成，请检查服务器采集器和网络')
+    if error in {'LoginRequired','SearchNeedsVerification'}:message='抖音号 '+job['douyin_id']+'：'+message
+    return {**body,'error':message,
+            'blocked':error in {'LoginRequired','SearchNeedsVerification'}}
+
+class Worker:
+    def __init__(self):
+        require_collection()
+        if os.environ.get('DOUYIN_BOARD_WORKER_ORIGIN'):
+            self.origin=os.environ['DOUYIN_BOARD_WORKER_ORIGIN']
+            from urllib.parse import urlparse
+            parsed=urlparse(self.origin)
+            if parsed.scheme!='http' or parsed.hostname!='127.0.0.1' or not parsed.port or parsed.path:raise ValueError('Worker origin must be the local board service')
+            self.token=os.environ['DOUYIN_BOARD_WORKER_TOKEN']
+        else:
+            cfg=json.loads((ROOT/'data/web-service.json').read_text(encoding='utf-8'))
+            self.origin='http://127.0.0.1:'+str(cfg['port'])
+            self.token=cfg['worker_token']
+        self.opener=build_opener(ProxyHandler({}))
+        self.command='';self.login=None;self.failures=0
+
+    def request(self,route,body=None):
+        req=Request(self.origin+route,data=json.dumps(body).encode() if body is not None else None,
+            headers={'Content-Type':'application/json','X-Worker-Token':self.token,'X-Collection-Engine':'f2'})
+        with self.opener.open(req,timeout=15) as response:return json.load(response)
+
+    def heartbeat(self,status):
+        command=self.request('/api/collection/heartbeat',{'status':status}).get('command')
+        if command:self.command=command
+
+    def launch(self,args,stdin=None):
+        return subprocess.Popen([str(RUNTIME),'-X','utf8',str(SCRIPT),*args,'--profile',str(PROFILE)],
+            stdin=stdin,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+
+    def collect(self,job):
+        folder=OUTPUT/job['token'];folder.mkdir(parents=True,exist_ok=True)
+        source=folder/'accounts.json'
+        # Always search by handle when supplied; a cached homepage is not identity proof.
+        source.write_text(json.dumps([job['douyin_id'] or job['homepage']]),encoding='utf-8')
+        process=self.launch(['query','--input',str(source),'--output',str(folder),'--headed','--max-failures','1'])
+        started=time.monotonic()
+        while process.poll() is None:
+            try:self.heartbeat('正在采集')
+            except Exception:pass
+            if time.monotonic()-started>180:
+                if os.name=='nt':subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                else:process.kill()
+                process.wait();break
+            time.sleep(2)
+        reports=list(folder.glob('*/results.json'))
+        row=json.loads(reports[-1].read_text(encoding='utf-8'))['results'][0] if reports else {'status':'failed'}
+        body=result_body(job,row)
+        self.failures=self.failures+1 if body.get('error') else 0
+        if self.failures>=3:
+            body.update(blocked=True,error=body['error']+'；连续3次失败，队列暂停，请检查后继续')
+        # Keep retrying delivery, not the upstream request; no lost successful result.
+        while True:
+            try:self.request('/api/collection/result',body);break
+            except HTTPError as error:
+                if error.code==400:
+                    self.request('/api/collection/result',dict(account_id=job['account_id'],token=job['token'],error='采集结果校验失败，未更新数量'))
+                    break
+                time.sleep(5)
+            except Exception:time.sleep(5)
+        time.sleep(3)
+
+    def run(self):
+        while True:
+            try:
+                self.heartbeat('等待手动登录或验证' if self.login else '待命')
+                command,self.command=self.command,''
+                if command=='open' and not self.login:
+                    self.login=self.launch(['login'],subprocess.PIPE)
+                if command=='resume':
+                    self.failures=0
+                    if self.login and self.login.poll() is None:
+                        self.login.stdin.write(b'\n');self.login.stdin.flush()
+                if self.login:
+                    if self.login.poll() is not None:self.login=None
+                else:
+                    job=self.request('/api/collection/next').get('job')
+                    if job:
+                        try:self.collect(job)
+                        except Exception:
+                            self.request('/api/collection/result',dict(account_id=job['account_id'],token=job['token'],error='采集器异常，请检查运行环境后继续',blocked=True))
+            except Exception:
+                pass  # No signed upstream URLs, cookies or secrets in logs.
+            time.sleep(3)
+
+def main():
+    require_collection()
+    # One consumer per host, including when a desktop client is also open.
+    import msvcrt
+    lock_path=ROOT/'data/f2-worker.lock'
+    with lock_path.open('a+b') as lock:
+        lock.seek(0);lock.write(b'1');lock.flush();lock.seek(0)
+        try:msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+        except OSError:return
+        Worker().run()
+
+if __name__=='__main__':main()

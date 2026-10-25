@@ -13,7 +13,8 @@ function renderPersonOffices(chosen){
 }
 function selectedOffices(){return [...document.querySelectorAll('#personOffices input:checked')].map(input=>input.value);}
 const pendingRequestIds=new Map();
-function claimRequestId(key){if(!pendingRequestIds.has(key))pendingRequestIds.set(key,crypto.randomUUID());return pendingRequestIds.get(key);}
+function newRequestId(){if(typeof crypto.randomUUID==='function')return crypto.randomUUID();const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);bytes[6]=bytes[6]&15|64;bytes[8]=bytes[8]&63|128;let hex='';for(let i=0;i<16;i++)hex+=bytes[i].toString(16).padStart(2,'0');return hex.slice(0,8)+'-'+hex.slice(8,12)+'-'+hex.slice(12,16)+'-'+hex.slice(16,20)+'-'+hex.slice(20);}
+function claimRequestId(key){if(!pendingRequestIds.has(key))pendingRequestIds.set(key,newRequestId());return pendingRequestIds.get(key);}
 function settleRequestId(key,error){if(error&&error.status===undefined)return;pendingRequestIds.delete(key);}
 async function request(path,body){
  const response=await fetch(path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json','X-CSRF-Token':metadata?.user?.csrf||''}:{},body:body?JSON.stringify(body):undefined});
